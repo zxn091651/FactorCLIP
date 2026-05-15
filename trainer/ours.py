@@ -159,7 +159,7 @@ class TextEncoder(nn.Module):
 class StableDiffusion(nn.Module):
     """Stable Diffusion wrapper for image generation."""
     # model_id="runwayml/stable-diffusion-v1-5"
-    def __init__(self, model_id="runwayml/stable-diffusion-v1-5"):
+    def __init__(self, model_id="runwayml/stable-diffusion-v1-5", semantic_noise_std: float = 0.05):
         super().__init__()
         # self.pipe = StableDiffusionPipeline.from_pretrained(
         #     model_id, 
@@ -184,6 +184,7 @@ class StableDiffusion(nn.Module):
         # Set generator seed before each use
         # self.generator = torch.Generator(device=device)
         self.pipe.set_progress_bar_config(disable=True)
+        self.semantic_noise_std = semantic_noise_std
     
     
 
@@ -198,6 +199,22 @@ class StableDiffusion(nn.Module):
         repeats = (batchsize + len(prompt) - 1) // len(prompt)
         return (prompt * repeats)[:batchsize]
 
+    def _encode_prompt_with_semantic_noise(self, prompt: str) -> torch.Tensor:
+        text_inputs = self.pipe.tokenizer(
+            prompt,
+            padding="max_length",
+            max_length=self.pipe.tokenizer.model_max_length,
+            truncation=True,
+            return_tensors="pt",
+        )
+        input_ids = text_inputs.input_ids.to(device)
+        with torch.no_grad():
+            prompt_embeds = self.pipe.text_encoder(input_ids)[0]
+        if self.semantic_noise_std > 0:
+            noise = torch.randn_like(prompt_embeds) * self.semantic_noise_std
+            prompt_embeds = prompt_embeds + noise
+        return prompt_embeds
+
     def forward(self, batch_size, pos_prompt: Union[str, List[str]], neg_prompt: Union[str, List[str]]):
         """Generate images from prompts."""
         if isinstance(pos_prompt, list):
@@ -211,9 +228,11 @@ class StableDiffusion(nn.Module):
         generated_images = []
         with torch.no_grad():
             for i in range(batchsize):
+                noisy_prompt_embeds = self._encode_prompt_with_semantic_noise(positive_prompts[i])
+                noisy_negative_prompt_embeds = self._encode_prompt_with_semantic_noise(negative_prompts[i])
                 batch_output = self.pipe(
-                    prompt=positive_prompts[i],
-                    negative_prompt=negative_prompts[i],
+                    prompt_embeds=noisy_prompt_embeds,
+                    negative_prompt_embeds=noisy_negative_prompt_embeds,
                     guidance_scale=15,
                     # generator=self.generator,
                 )
@@ -364,10 +383,8 @@ class DynamicPseudoUnknownGenerator:
 
         for _ in range(near_count):
             base_prompt = random.choice(self.prompt_pool)
-            cls_a, cls_b = random.sample(self.known_class_names, 2)
-            donor = (cls_b.replace("_", " ") + " " + random.choice(self.prompt_pool)).split()
-            mixed = self._mix_prompt_tokens(base_prompt, donor, replace_ratio=0.25)
-            prompts.append(f"{domain_phrase} of a {mixed} blending {cls_a.replace('_', ' ')} traits")
+            cls_a = random.choice(self.known_class_names)
+            prompts.append(f"{domain_phrase} blending {cls_a.replace('_', ' ')} and {base_prompt}")
             modes.append("near")
 
         far_a, far_b = guide.get("farthest_pair_names", random.sample(self.known_class_names, 2))
