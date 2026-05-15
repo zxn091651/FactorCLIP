@@ -660,7 +660,6 @@ class CustomCLIP(nn.Module):
         logits = logit_scale * image_features @ text_features.t()
 
         if dom_label is not None:
-            # 每层对 patch 均值得到类分布并求熵；仅已知样本参与 batch 平均（unknown 不参与）
             visual = self.image_encoder
             num_patches = visual.positional_embedding.shape[0] - 1
             known_mask = (label < self.num_class - 1).float()
