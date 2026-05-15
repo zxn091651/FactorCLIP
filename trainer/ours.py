@@ -308,16 +308,6 @@ class DynamicPseudoUnknownGenerator:
         self.unknown_distance_near: List[float] = []
         self.unknown_distance_far: List[float] = []
 
-    def _mix_prompt_tokens(self, base_prompt: str, donor_tokens: List[str], replace_ratio: float = 0.25) -> str:
-        base_tokens = base_prompt.split()
-        if not base_tokens:
-            return base_prompt
-        n_replace = max(1, int(len(base_tokens) * replace_ratio))
-        replace_indices = random.sample(range(len(base_tokens)), min(n_replace, len(base_tokens)))
-        for idx in replace_indices:
-            base_tokens[idx] = random.choice(donor_tokens) if donor_tokens else base_tokens[idx]
-        return " ".join(base_tokens)
-
     def _topk_known_class_names(self, labels: torch.Tensor, topk: int = 3) -> List[str]:
         if labels.numel() == 0:
             return []
