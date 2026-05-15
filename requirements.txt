@@ -1,0 +1,13 @@
+transformers==4.29.2
+diffusers
+invisible-watermark
+scikit-learn
+tqdm
+ftfy
+regex
+yacs
+einops
+h5py
+tb-nightly
+future
+six

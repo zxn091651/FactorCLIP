@@ -1,0 +1,43 @@
+# ========== 数据集（不备份） ==========
+datasets/
+data/
+**/domainbed/
+
+# ========== 实验结果与输出（不备份） ==========
+experiments/
+experiments_*/
+experiments_mini/
+out_*/
+output/
+results/
+logs/
+runs/
+wandb/
+jobs*/
+
+# ========== 模型权重与检查点（不备份） ==========
+*.pth
+*.pt
+*.ckpt
+*.safetensors
+checkpoints/
+checkpoint/
+
+# ========== Python ==========
+*/__pycache__/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# ========== IDE ==========
+.idea/
+.vscode/
+*.swp
+
+# ========== 大体积压缩包 ==========
+*.tar
+*.tar.gz
+*.zip
