@@ -472,7 +472,7 @@ train_model = train_model.to(device)
 
 for epoch in range(num_epochs):
     closed_set_features = []    
-    closed_set_labels = []  # To store labels of closed-set samples
+    closed_set_labels = []  
     open_set_features = []
     print(f"Epoch: {epoch + 1}")
     train_model.train()
