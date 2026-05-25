@@ -561,16 +561,16 @@ class DynamicPseudoUnknownGenerator:
 
         return prompts, modes, anchors
 
-    def build_dynamic_neg_prompts(self, modes: List[str], recent_known: List[str]) -> List[str]:
+    def build_dynamic_neg_prompts(self, count: int) -> List[str]:
+        """
+        Unified negative prompt strategy (no near/far split):
+        "other known classes + extra terms".
+        """
         terms = self._non_llm_negative_terms()
         negatives = []
-        for mode in modes:
-            if mode == "far":
-                sampled = ", ".join(random.sample(terms, min(2, len(terms)))) if len(terms) > 0 else ""
-                negatives.append(f"{self.known_classes_text}, {sampled}".strip(", "))
-            else:
-                sampled_known = random.choice(recent_known) if recent_known else ""
-                negatives.append(f"{self.known_classes_text}, {sampled_known}".strip(", "))
+        for _ in range(count):
+            sampled = ", ".join(random.sample(terms, min(2, len(terms)))) if len(terms) > 0 else ""
+            negatives.append(f"{self.known_classes_text}, {sampled}".strip(", "))
         return negatives
 
     def _pool_offline_attribute(
@@ -650,14 +650,13 @@ class DynamicPseudoUnknownGenerator:
     ) -> Tuple[torch.Tensor, List[str], Dict]:
         batch_size = self.dynamic_batch_size if self.enable_dynamic else 1
         guide = self.compute_feature_space_guide(model, known_images, known_labels)
-        recent_known = self._topk_known_class_names(known_labels, topk=3)
         used_attri = attri_embed if attri_embed is not None else self.attri_embed
         used_mask = mask_embed if mask_embed is not None else self.mask_embed
 
         if self.enable_dynamic:
             try:
                 pos_prompts, modes, anchors = self.build_dynamic_pos_prompts(domain_name, guide, batch_size)
-                neg_prompts = self.build_dynamic_neg_prompts(modes, recent_known)
+                neg_prompts = self.build_dynamic_neg_prompts(len(modes))
                 prompt_deltas = self._build_prompt_deltas(
                     model=model,
                     known_images=known_images,
@@ -875,6 +874,12 @@ class CustomCLIP(nn.Module):
         self.per_class_gate = nn.Parameter(torch.ones(len(classnames) - 1) * 0.5)
         self.cross_attention = CrossAttention(512, config["n_head"])
         self.projector = nn.Linear(512, 512)
+        # Prompt-2 builder: [dom] + [v_sem^1 ... v_sem^K] + [CLS]
+        self.class_semantic_builder = SemanticPromptBuilder(
+            embed_dim=512,
+            num_semantic_heads=max(1, self.ctx - 1),
+            sd_embed_dim=768,
+        )
         # self.projector = nn.Identity()
         
       
@@ -884,6 +889,9 @@ class CustomCLIP(nn.Module):
         self.classnames = classnames
         self.domainnames = domainnames
         self.gated = gated
+        self.rep_margin = 0.2
+        # Cache latest unknown-class prompt embeddings for external training losses.
+        self.latest_unknown_prompt_embeddings: Optional[torch.Tensor] = None
 
     def get_image_features(self, image: torch.Tensor) -> torch.Tensor:
         """Extract image features with prompt conditioning."""
@@ -926,10 +934,12 @@ class CustomCLIP(nn.Module):
         logit_scale = self.logit_scale.exp()
         logits = logit_scale * image_features @ text_features.t()
 
-        if dom_label is not None:
+        if dom_label is not None and batch is not None:
             visual = self.image_encoder
             num_patches = visual.positional_embedding.shape[0] - 1
             known_mask = (label < self.num_class - 1).float()
+            known_count = image_features.size(0) - batch if batch is not None else image_features.size(0)
+            unknown_count = image_features.size(0) - known_count
 
             entropy_layer_terms = []
             for layer_feat in layer_feat_list:
@@ -947,31 +957,269 @@ class CustomCLIP(nn.Module):
 
             layer_loss = torch.stack(entropy_layer_terms).mean()
 
-            txt_features = text_features[:-1, :].repeat(image_features.size(0) - batch, 1)
-
-            loss_sty, sty_embedding = self._compute_style_loss(
-                image_features[:-batch, :], dom_label[:-batch], label[:-batch], attri, mask_embed, logit_scale
+            txt_features = text_features[:-1, :].repeat(known_count, 1)
+            if layer_feat_list:
+                known_patch_tokens = layer_feat_list[-1][:known_count, 1 : 1 + num_patches, :]
+                low_level_known_features = layer_feat_list[0][:known_count, 1 : 1 + num_patches, :].mean(dim=1)
+                low_level_known_features = F.normalize(low_level_known_features, dim=-1)
+            else:
+                known_patch_tokens = image_features[:known_count, :].unsqueeze(1)
+                low_level_known_features = image_features[:known_count, :]
+            known_patch_tokens = F.normalize(known_patch_tokens, dim=-1)
+            high_level_known_features = image_features[:known_count, :]
+            high_level_unknown_features = (
+                image_features[known_count:, :] if unknown_count > 0 else torch.empty(0, image_features.size(-1), device=image_features.device)
             )
-            return logits, loss_sty, txt_features, sty_embedding, layer_loss
+            known_labels = label[:known_count]
+
+            loss_sty, domain_prompt_embeddings, semantic_prompt_embeddings, unknown_prompt_embedding = self._compute_style_loss(
+                low_level_known_features,
+                dom_label[:-batch],
+                known_labels,
+                attri,
+                mask_embed,
+                logit_scale,
+                known_patch_tokens,
+            )
+            known_cls = self.num_class - 1
+            semantic_prompt_per_sample = semantic_prompt_embeddings.view(known_count, known_cls, -1)
+            domain_prompt_per_sample = domain_prompt_embeddings.view(known_count, known_cls, -1)
+            unknown_prompt_per_sample = unknown_prompt_embedding
+
+            # L_align between prompt-(1) and prompt-(2)
+            align_loss = (1 - F.cosine_similarity(domain_prompt_embeddings, semantic_prompt_embeddings, dim=1)).mean()
+
+            # Semantic classification with prompt-(2) and prompt-(3) on high-level image embeddings
+            known_prompt_proto = semantic_prompt_per_sample.mean(dim=0)  # [C, D]
+            unknown_prompt_proto = unknown_prompt_per_sample.mean(dim=0, keepdim=True)  # [1, D]
+            semantic_proto = torch.cat([known_prompt_proto, unknown_prompt_proto], dim=0)  # [C+1, D]
+            semantic_logits_known = logit_scale * (high_level_known_features @ semantic_proto.t())
+            semantic_cls_loss = F.cross_entropy(semantic_logits_known, known_labels)
+            if unknown_count > 0:
+                semantic_logits_unknown = logit_scale * (high_level_unknown_features @ semantic_proto.t())
+                unknown_targets = torch.full(
+                    (unknown_count,), known_cls, device=image_features.device, dtype=torch.long
+                )
+                semantic_cls_loss = semantic_cls_loss + F.cross_entropy(
+                    semantic_logits_unknown, unknown_targets
+                )
+
+            # L_rep: keep unknown prompt separated from known visual class prototypes
+            class_visual_prototypes = []
+            for c in range(known_cls):
+                cls_mask = known_labels == c
+                if cls_mask.any():
+                    class_visual_prototypes.append(high_level_known_features[cls_mask].mean(dim=0))
+            if class_visual_prototypes:
+                class_visual_prototypes = F.normalize(torch.stack(class_visual_prototypes, dim=0), dim=-1)
+                rep_sims = unknown_prompt_per_sample @ class_visual_prototypes.t()
+                rep_loss = F.relu(self.rep_margin - rep_sims).mean()
+            else:
+                rep_loss = torch.zeros((), device=image_features.device, dtype=image_features.dtype)
+
+            # L_coh: unknown prompt vs mean known semantic prompts
+            semantic_mean_per_sample = semantic_prompt_per_sample.mean(dim=1)
+            coh_loss = ((unknown_prompt_per_sample - semantic_mean_per_sample) ** 2).sum(dim=1).mean()
+
+            self.latest_unknown_prompt_embeddings = unknown_prompt_embedding
+            return (
+                logits,
+                loss_sty,
+                txt_features,
+                semantic_prompt_embeddings,
+                layer_loss,
+                align_loss,
+                semantic_cls_loss,
+                rep_loss,
+                coh_loss,
+            )
         else:
-            return logits, image_features
-    def _process_domain_features(self, domain_features, cross_atten, domain_img, 
-                               tokenized_prompts, logit_scale, original_indices, 
-                               sty_embedding_list):
-        """Process features for a specific domain."""
-        domain_embeddings = []
+            self.latest_unknown_prompt_embeddings = None
+            semantic_logits = self._build_semantic_inference_logits(
+                image_features=image_features,
+                layer_feat_list=layer_feat_list,
+                dom_label=dom_label,
+                logit_scale=logit_scale,
+            )
+            return semantic_logits, image_features
+    def _build_class_semantic_prompt_embeddings(
+        self,
+        patch_tokens: torch.Tensor,
+        global_features: torch.Tensor,
+        tokenized_prompts: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Build prompt-2 embeddings with structure:
+        [dom] + [v_sem^1 ... v_sem^K] + [CLS(class)].
+
+        The visual semantic embeddings are extracted from patch tokens with the
+        same semantic builder family used in generated-image positive prompts.
+        """
+        with torch.no_grad():
+            base_embedding = clip_model.token_embedding(tokenized_prompts).type(self.dtype)
+
+        ctx_tokens = self._build_dom_semantic_ctx_tokens(patch_tokens, global_features)
+        return self._encode_prompts_with_ctx(base_embedding, tokenized_prompts, ctx_tokens)
+
+    def _build_dom_semantic_ctx_tokens(
+        self, patch_tokens: torch.Tensor, global_features: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Build ctx tokens shared by prompt-2/prompt-3:
+        [dom] + [v_sem^1 ... v_sem^m].
+        """
+        semantic_tokens = self.class_semantic_builder.extract_semantic_tokens(patch_tokens)
+        semantic_tokens = self.class_semantic_builder.project_semantic_tokens(semantic_tokens)
+        domain_token = self.class_semantic_builder.project_domain_token(global_features)
+
+        batch_size = patch_tokens.size(0)
+        ctx_tokens = torch.zeros(
+            batch_size,
+            self.ctx,
+            semantic_tokens.size(-1),
+            device=patch_tokens.device,
+            dtype=semantic_tokens.dtype,
+        )
+        ctx_tokens[:, 0, :] = domain_token
+        if self.ctx > 1 and semantic_tokens.size(1) > 0:
+            use_k = min(self.ctx - 1, semantic_tokens.size(1))
+            ctx_tokens[:, 1 : 1 + use_k, :] = semantic_tokens[:, :use_k, :]
+        return ctx_tokens
+
+    def _encode_prompts_with_ctx(
+        self,
+        base_embedding: torch.Tensor,
+        tokenized_prompts: torch.Tensor,
+        ctx_tokens: torch.Tensor,
+    ) -> torch.Tensor:
+        prompt_embeddings: List[torch.Tensor] = []
+        token_start = 1
+        token_end = token_start + self.ctx
+        batch_size = ctx_tokens.size(0)
+        for i in range(batch_size):
+            embedding_copy = base_embedding.clone()
+            embedding_copy[:, token_start:token_end, :] += ctx_tokens[i].unsqueeze(0).to(
+                device=embedding_copy.device, dtype=embedding_copy.dtype
+            )
+            embedding_int = self.text_encoder(embedding_copy, tokenized_prompts)
+            prompt_embeddings.append(F.normalize(embedding_int, dim=-1))
+        return torch.stack(prompt_embeddings, dim=0)
+
+    def _build_unknown_semantic_prompt_embeddings(
+        self,
+        patch_tokens: torch.Tensor,
+        global_features: torch.Tensor,
+        tokenized_unknown_prompt: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Build prompt-3 unknown-class prompt embeddings:
+        [dom] + [v_1 ... v_m] + [unknown].
+        """
+        with torch.no_grad():
+            base_embedding = clip_model.token_embedding(tokenized_unknown_prompt).type(self.dtype)
+        ctx_tokens = self._build_dom_semantic_ctx_tokens(patch_tokens, global_features)
+        unknown_prompt_embeddings = self._encode_prompts_with_ctx(
+            base_embedding, tokenized_unknown_prompt, ctx_tokens
+        )
+        # [B, 1, D] -> [B, D]
+        return unknown_prompt_embeddings[:, 0, :]
+
+    def _build_semantic_inference_logits(
+        self,
+        image_features: torch.Tensor,
+        layer_feat_list: List[torch.Tensor],
+        dom_label: Optional[torch.Tensor],
+        logit_scale: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Inference head based on prompt-(2) and prompt-(3):
+        compute similarity between high-level image embedding and
+        [known semantic prompts + unknown prompt].
+        """
+        device = image_features.device
+        batch_size = image_features.size(0)
+        known_cls = self.num_class - 1
+        domain_count = max(1, len(self.domainnames))
+
+        if layer_feat_list:
+            visual = self.image_encoder
+            num_patches = visual.positional_embedding.shape[0] - 1
+            patch_tokens = layer_feat_list[-1][:, 1 : 1 + num_patches, :]
+        else:
+            patch_tokens = image_features.unsqueeze(1)
+        patch_tokens = F.normalize(patch_tokens, dim=-1)
+
+        if dom_label is None:
+            dom_idx_tensor = torch.zeros(batch_size, dtype=torch.long, device=device)
+        else:
+            dom_idx_tensor = dom_label.long().to(device)
+
+        semantic_logits_list = []
+        for i in range(batch_size):
+            dom_idx = int(dom_idx_tensor[i].item()) % domain_count
+            domain_name = self.domainnames[dom_idx].replace("_", " ")
+            tokenized_prompts = torch.cat(
+                [clip.tokenize(f"A {domain_name} of a {p}") for p in self.classnames[:-1]]
+            ).to(device)
+            tokenized_unknown_prompt = clip.tokenize(
+                f"A {domain_name} of a {self.classnames[-1]}"
+            ).to(device)
+
+            sample_patch_tokens = patch_tokens[i : i + 1]
+            sample_global_features = image_features[i : i + 1]
+            semantic_prompt_embeddings = self._build_class_semantic_prompt_embeddings(
+                patch_tokens=sample_patch_tokens,
+                global_features=sample_global_features,
+                tokenized_prompts=tokenized_prompts,
+            )[0]  # [C, D]
+            unknown_prompt_embedding = self._build_unknown_semantic_prompt_embeddings(
+                patch_tokens=sample_patch_tokens,
+                global_features=sample_global_features,
+                tokenized_unknown_prompt=tokenized_unknown_prompt,
+            )[0].unsqueeze(0)  # [1, D]
+
+            semantic_proto = torch.cat(
+                [semantic_prompt_embeddings[:known_cls], unknown_prompt_embedding], dim=0
+            )  # [C+1, D]
+            semantic_logits = logit_scale * (image_features[i] @ semantic_proto.t())
+            semantic_logits_list.append(semantic_logits)
+
+        return torch.stack(semantic_logits_list, dim=0)
+
+    def _process_domain_features(
+        self,
+        domain_features,
+        cross_atten,
+        domain_img,
+        tokenized_prompts,
+        logit_scale,
+    ):
+        """
+        Build domain-modeled semantic-generic known-class prompts.
+
+        cross_atten gives class-specific attribute-enhanced vectors A'_y(x).
+        We follow the paper-style design by averaging over classes to obtain
+        class-agnostic A''(x), then add A''(x) token-wise to each known-class
+        domain-specific base prompt.
+        """
+        # Prompt embeddings generated by domain-modeled semantic-generic prompts.
+        domain_prompt_embeddings = []
         domain_logits = []
         
         with torch.no_grad():
             embedding = clip_model.token_embedding(tokenized_prompts).type(self.dtype)
         
+        # cross_atten: [num_known_cls, num_samples, dim]
+        class_agnostic_ctx = cross_atten.mean(dim=0)  # [num_samples, dim]
+        token_start = 1
+        token_end = token_start + self.ctx
+
         for i in range(domain_features.size(0)):
             embedding_copy = embedding.clone()
-            
-            
-            ctx_i = cross_atten[:, i, :].unsqueeze(1)
-            
-            embedding_copy[:, 1:5, :] += ctx_i
+
+            # A''(x_i): same context added to all known-class prompts.
+            ctx_i = class_agnostic_ctx[i].view(1, 1, -1)
+            embedding_copy[:, token_start:token_end, :] += ctx_i
             
             # Compute embeddings and logits
             embedding_int = self.text_encoder(embedding_copy, tokenized_prompts)
@@ -979,23 +1227,21 @@ class CustomCLIP(nn.Module):
             logit = logit_scale * domain_features[i] @ embedding_int.t()
             
             domain_logits.append(logit)
-            domain_embeddings.append(embedding_int)
+            domain_prompt_embeddings.append(embedding_int)
         
-        # Store results with original indices
         domain_logits = torch.stack(domain_logits)
-        domain_embeddings = torch.stack(domain_embeddings)
-        
-        for i, idx in enumerate(original_indices):
-            sty_embedding_list.append((idx.item(), domain_embeddings[i]))
-        
-        return domain_logits
+        domain_prompt_embeddings = torch.stack(domain_prompt_embeddings)
+
+        return domain_logits, domain_prompt_embeddings
     @torch.cuda.amp.autocast()
     def _compute_style_loss(self, image_features: torch.Tensor, dom_label: torch.Tensor,
                         label: torch.Tensor, attri: torch.Tensor, mask_embed: torch.Tensor,
-                        logit_scale: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+                        logit_scale: torch.Tensor, known_patch_tokens: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Compute style adaptation loss across domains."""
         device = image_features.device
-        sty_embedding_list = []
+        semantic_prompt_embedding_list = []
+        unknown_prompt_embedding_list = []
+        domain_prompt_embedding_list = []
         
         # Collect all logits and labels from all domains
         all_logits = []
@@ -1010,20 +1256,38 @@ class CustomCLIP(nn.Module):
             
             original_indices = torch.nonzero(domain_mask, as_tuple=False).squeeze(1)
             domain_labels = label[domain_mask]
+            domain_patch_tokens = known_patch_tokens[domain_mask]
         
             domain_name = self.domainnames[domain].replace('_', ' ')
             tokenized_prompts = torch.cat([
                 clip.tokenize(f"A {domain_name} of a {p}")
                 for p in self.classnames[:-1]
             ]).to(device)
+            tokenized_unknown_prompt = clip.tokenize(
+                f"A {domain_name} of a {self.classnames[-1]}"
+            ).to(device)
         
             n_cls = len(self.classnames)
             domain_img = einops.repeat(domain_features, 'm n -> k m n', k=n_cls-1)
             cross_atten = self.cross_attention(domain_img, self.projector(attri), mask_embed)
-            domain_logits = self._process_domain_features(
+            domain_logits, domain_prompt_embeddings = self._process_domain_features(
                 domain_features, cross_atten, domain_img, tokenized_prompts,
-                logit_scale, original_indices, sty_embedding_list
+                logit_scale
             )
+            semantic_prompt_embeddings = self._build_class_semantic_prompt_embeddings(
+                patch_tokens=domain_patch_tokens,
+                global_features=domain_features,
+                tokenized_prompts=tokenized_prompts,
+            )
+            unknown_prompt_embeddings = self._build_unknown_semantic_prompt_embeddings(
+                patch_tokens=domain_patch_tokens,
+                global_features=domain_features,
+                tokenized_unknown_prompt=tokenized_unknown_prompt,
+            )
+            for i, idx in enumerate(original_indices):
+                domain_prompt_embedding_list.append((idx.item(), domain_prompt_embeddings[i]))
+                semantic_prompt_embedding_list.append((idx.item(), semantic_prompt_embeddings[i]))
+                unknown_prompt_embedding_list.append((idx.item(), unknown_prompt_embeddings[i]))
             
             # Collect logits and labels instead of computing loss immediately
             all_logits.append(domain_logits)
@@ -1040,7 +1304,23 @@ class CustomCLIP(nn.Module):
         else:
             total_loss = torch.tensor(0.0, device=device, requires_grad=True)
     
-        sty_embedding_list.sort(key=lambda x: x[0])
-        sty_embedding = torch.cat([x[1] for x in sty_embedding_list]) if sty_embedding_list else torch.empty(0, device=device)
-    
-        return total_loss, sty_embedding
+        domain_prompt_embedding_list.sort(key=lambda x: x[0])
+        domain_prompt_embeddings = (
+            torch.cat([x[1] for x in domain_prompt_embedding_list])
+            if domain_prompt_embedding_list
+            else torch.empty(0, device=device)
+        )
+        semantic_prompt_embedding_list.sort(key=lambda x: x[0])
+        prompt_embeddings = (
+            torch.cat([x[1] for x in semantic_prompt_embedding_list])
+            if semantic_prompt_embedding_list
+            else torch.empty(0, device=device)
+        )
+        unknown_prompt_embedding_list.sort(key=lambda x: x[0])
+        unknown_prompt_embeddings = (
+            torch.stack([x[1] for x in unknown_prompt_embedding_list], dim=0)
+            if unknown_prompt_embedding_list
+            else torch.empty(0, device=device)
+        )
+
+        return total_loss, domain_prompt_embeddings, prompt_embeddings, unknown_prompt_embeddings

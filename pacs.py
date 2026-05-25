@@ -291,6 +291,12 @@ train_prev_classnames = class_names[:6]
 class_to_attri_idx = {name: idx for idx, name in enumerate(train_prev_classnames)}
 
 image_filter = ImageFilter(brightness_threshold=0.01)
+W_DOMAIN = 0.33
+W_ALIGN = 1.0
+W_ALIGN_PROMPT12 = 1.0
+W_SEMANTIC_CLS = 1.0
+W_REP = 0.5
+W_COH = 0.2
 
 def train_epoch(model,params, dynamic_unknown_generator, domainnames, train_loader, optimizer, lr_scheduler, step,epoch):
     loss_meter = AvgMeter()
@@ -336,14 +342,28 @@ def train_epoch(model,params, dynamic_unknown_generator, domainnames, train_load
         domain = torch.cat((domain_prev, selected_domains), dim=0)
         domain = domain.to(device)
         
-        output, loss_sty, invariant, feat, layer_loss = model(
+        (
+            output,
+            loss_sty,
+            invariant,
+            feat,
+            layer_loss,
+            align_loss,
+            semantic_cls_loss,
+            rep_loss,
+            coh_loss,
+        ) = model(
             img, attri_embed, mask_embed, label, domain, len(random_indices)
         )
 
         crossentropy_loss = (
             F.cross_entropy(output, label)
-            + 0.33 * (loss_sty + layer_loss)
-            + (1 - F.cosine_similarity(invariant, feat, dim=1)).mean()
+            + W_DOMAIN * (loss_sty + layer_loss)
+            + W_ALIGN * (1 - F.cosine_similarity(invariant, feat, dim=1)).mean()
+            + W_ALIGN_PROMPT12 * align_loss
+            + W_SEMANTIC_CLS * semantic_cls_loss
+            + W_REP * rep_loss
+            + W_COH * coh_loss
         )
 
         loss = crossentropy_loss 
@@ -403,12 +423,15 @@ for p in train_model.cross_attention.parameters():
 train_model.projector.requires_grad = True
 for p in train_model.promptlearner.parameters():
     p.requires_grad = True
+for p in train_model.class_semantic_builder.parameters():
+    p.requires_grad = True
 
 
 params = [
             {"params": train_model.promptlearner.parameters(),'lr' : config["prompt_lr"]},
             {"params": train_model.projector.parameters(),'lr' : config["projector_lr"]},
             {"params": train_model.cross_attention.parameters(),'lr' : config["cross_attention_lr"]},
+            {"params": train_model.class_semantic_builder.parameters(), 'lr': config["prompt_lr"]},
             {"params": dynamic_unknown_generator.semantic_prompt_builder.parameters(), 'lr': config["prompt_lr"]},
         ]
 optimizer = torch.optim.AdamW(params,  weight_decay=config["weight_decay"])
@@ -525,7 +548,13 @@ for epoch in range(num_epochs):
             test_label_one_hot = test_label_one_hot.to(device)
             
             # with profile(with_flops=True) as prof:
-            test_output,_ = test_model(test_img.to(device),attri_embed,mask_embed,test_label)
+            test_output,_ = test_model(
+                test_img.to(device),
+                attri_embed,
+                mask_embed,
+                test_label,
+                test_domain,
+            )
 
             predictions = torch.argmax(test_output, dim=1)
             class_a_mask = (test_label <= 5) 
