@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from collections import OrderedDict
-from typing import List, Dict, Tuple, Union
+from typing import List, Dict, Optional, Tuple, Union
 import random
 
 import numpy as np
@@ -156,10 +156,106 @@ class TextEncoder(nn.Module):
         return x
 
 
+class SemanticTokenExtractor(nn.Module):
+    """Extract K semantic tokens from patch embeddings."""
+
+    def __init__(self, embed_dim: int = 512, num_semantic_heads: int = 4):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.num_semantic_heads = num_semantic_heads
+        self.query_vectors = nn.Parameter(torch.randn(num_semantic_heads, embed_dim))
+        nn.init.normal_(self.query_vectors, std=0.02)
+
+    def forward(self, patch_embeddings: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            patch_embeddings: [B, N, D]
+        Returns:
+            semantic tokens: [B, K, D]
+        """
+        if patch_embeddings.dim() != 3:
+            raise ValueError("patch_embeddings must be [B, N, D]")
+
+        patch_embeddings = patch_embeddings.to(
+            device=self.query_vectors.device, dtype=self.query_vectors.dtype
+        )
+
+        semantic_tokens: List[torch.Tensor] = []
+        for k in range(self.num_semantic_heads):
+            attention_scores = torch.matmul(patch_embeddings, self.query_vectors[k])  # [B, N]
+            attention_weights = F.softmax(attention_scores, dim=1)
+            token_k = torch.sum(attention_weights.unsqueeze(-1) * patch_embeddings, dim=1)  # [B, D]
+            semantic_tokens.append(token_k)
+        return torch.stack(semantic_tokens, dim=1)
+
+
+class SemanticPromptBuilder(nn.Module):
+    """Build PP-style semantic vectors and project them to SD text space."""
+
+    def __init__(
+        self,
+        embed_dim: int = 512,
+        num_semantic_heads: int = 4,
+        sd_embed_dim: int = 768,
+    ):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.num_semantic_heads = num_semantic_heads
+        self.semantic_extractor = SemanticTokenExtractor(
+            embed_dim=embed_dim, num_semantic_heads=num_semantic_heads
+        )
+        self.domain_projection = nn.Linear(embed_dim, embed_dim)
+        self.semantic_projections = nn.ModuleList(
+            [nn.Linear(embed_dim, embed_dim) for _ in range(num_semantic_heads)]
+        )
+        self.sd_projection = nn.Linear(embed_dim, sd_embed_dim)
+
+    def extract_semantic_tokens(self, patch_embeddings: torch.Tensor) -> torch.Tensor:
+        return self.semantic_extractor(patch_embeddings)
+
+    def project_semantic_tokens(self, semantic_tokens: torch.Tensor) -> torch.Tensor:
+        if semantic_tokens.dim() != 3:
+            raise ValueError("semantic_tokens must be [B, K, D]")
+        projected = []
+        for k in range(self.num_semantic_heads):
+            projected.append(self.semantic_projections[k](semantic_tokens[:, k, :]))
+        return torch.stack(projected, dim=1)
+
+    def project_domain_token(self, global_features: torch.Tensor) -> torch.Tensor:
+        if global_features.dim() != 2:
+            raise ValueError("global_features must be [B, D]")
+        return self.domain_projection(global_features)
+
+    def to_sd_prompt_delta(
+        self,
+        semantic_tokens: torch.Tensor,
+        domain_token: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Args:
+            semantic_tokens: [K, D] or [1, K, D]
+            domain_token: [D] or [1, D]
+        Returns:
+            prompt delta in SD space: [1, K, 768]
+        """
+        if semantic_tokens.dim() == 2:
+            semantic_tokens = semantic_tokens.unsqueeze(0)
+        if domain_token.dim() == 1:
+            domain_token = domain_token.unsqueeze(0)
+        semantic_tokens = semantic_tokens + domain_token.unsqueeze(1)
+        return self.sd_projection(semantic_tokens)
+
+
 class StableDiffusion(nn.Module):
     """Stable Diffusion wrapper for image generation."""
     # model_id="runwayml/stable-diffusion-v1-5"
-    def __init__(self, model_id="runwayml/stable-diffusion-v1-5", semantic_noise_std: float = 0.05):
+    def __init__(
+        self,
+        model_id="runwayml/stable-diffusion-v1-5",
+        semantic_noise_std: float = 0.05,
+        semantic_heads: int = 4,
+        semantic_alpha: float = 0.3,
+    ):
         super().__init__()
         # self.pipe = StableDiffusionPipeline.from_pretrained(
         #     model_id, 
@@ -185,8 +281,8 @@ class StableDiffusion(nn.Module):
         # self.generator = torch.Generator(device=device)
         self.pipe.set_progress_bar_config(disable=True)
         self.semantic_noise_std = semantic_noise_std
-    
-    
+        self.semantic_heads = semantic_heads
+        self.semantic_alpha = semantic_alpha
 
 
     def _expand_prompt_list(self, prompt: Union[str, List[str]], batchsize: int) -> List[str]:
@@ -199,7 +295,27 @@ class StableDiffusion(nn.Module):
         repeats = (batchsize + len(prompt) - 1) // len(prompt)
         return (prompt * repeats)[:batchsize]
 
-    def _encode_prompt_with_semantic_noise(self, prompt: str) -> torch.Tensor:
+    def _fuse_prompt_delta(
+        self, prompt_embeds: torch.Tensor, prompt_delta: Optional[torch.Tensor]
+    ) -> torch.Tensor:
+        if prompt_delta is None:
+            return prompt_embeds
+        if prompt_delta.dim() == 2:
+            prompt_delta = prompt_delta.unsqueeze(0)
+        token_count = min(prompt_delta.shape[1], prompt_embeds.shape[1] - 1)
+        if token_count <= 0:
+            return prompt_embeds
+        fused = prompt_embeds.clone()
+        fused[:, 1 : 1 + token_count, :] = (
+            fused[:, 1 : 1 + token_count, :]
+            + self.semantic_alpha
+            * prompt_delta[:, :token_count, :].to(device=fused.device, dtype=fused.dtype)
+        )
+        return fused
+
+    def _encode_prompt_with_semantic_noise(
+        self, prompt: str, prompt_delta: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
         text_inputs = self.pipe.tokenizer(
             prompt,
             padding="max_length",
@@ -213,9 +329,15 @@ class StableDiffusion(nn.Module):
         if self.semantic_noise_std > 0:
             noise = torch.randn_like(prompt_embeds) * self.semantic_noise_std
             prompt_embeds = prompt_embeds + noise
-        return prompt_embeds
+        return self._fuse_prompt_delta(prompt_embeds, prompt_delta)
 
-    def forward(self, batch_size, pos_prompt: Union[str, List[str]], neg_prompt: Union[str, List[str]]):
+    def forward(
+        self,
+        batch_size,
+        pos_prompt: Union[str, List[str]],
+        neg_prompt: Union[str, List[str]],
+        pos_prompt_deltas: Optional[List[torch.Tensor]] = None,
+    ):
         """Generate images from prompts."""
         if isinstance(pos_prompt, list):
             batchsize = len(pos_prompt)
@@ -224,11 +346,22 @@ class StableDiffusion(nn.Module):
 
         positive_prompts = self._expand_prompt_list(pos_prompt, batchsize)
         negative_prompts = self._expand_prompt_list(neg_prompt, batchsize)
+        if pos_prompt_deltas is None:
+            pos_prompt_deltas = [None] * batchsize
+        elif len(pos_prompt_deltas) == 0:
+            pos_prompt_deltas = [None] * batchsize
+        elif len(pos_prompt_deltas) < batchsize:
+            repeats = (batchsize + len(pos_prompt_deltas) - 1) // len(pos_prompt_deltas)
+            pos_prompt_deltas = (pos_prompt_deltas * repeats)[:batchsize]
+        else:
+            pos_prompt_deltas = pos_prompt_deltas[:batchsize]
         
         generated_images = []
         with torch.no_grad():
             for i in range(batchsize):
-                noisy_prompt_embeds = self._encode_prompt_with_semantic_noise(positive_prompts[i])
+                noisy_prompt_embeds = self._encode_prompt_with_semantic_noise(
+                    positive_prompts[i], pos_prompt_deltas[i]
+                )
                 noisy_negative_prompt_embeds = self._encode_prompt_with_semantic_noise(negative_prompts[i])
                 batch_output = self.pipe(
                     prompt_embeds=noisy_prompt_embeds,
@@ -244,22 +377,41 @@ class StableDiffusion(nn.Module):
 class GenerateUnknownImages(nn.Module):
     """Generate and preprocess unknown images using Stable Diffusion."""
     
-    def __init__(self):
+    def __init__(self, semantic_heads: int = 4, semantic_alpha: float = 0.3):
         super().__init__()
-        self.diffusion = StableDiffusion()
+        self.diffusion = StableDiffusion(
+            semantic_heads=semantic_heads,
+            semantic_alpha=semantic_alpha,
+        )
         self.resize_transform, self.normalize = get_image_transforms()
 
-    def forward(self, batch_size, pos_prompt: Union[str, List[str]], neg_prompt: Union[str, List[str]]):
+    def forward(
+        self,
+        batch_size,
+        pos_prompt: Union[str, List[str]],
+        neg_prompt: Union[str, List[str]],
+        pos_prompt_deltas: Optional[List[torch.Tensor]] = None,
+    ):
         """Generate normalized unknown images."""
-        generated_images = self.diffusion(batch_size, pos_prompt, neg_prompt)
+        generated_images = self.diffusion(
+            batch_size, pos_prompt, neg_prompt, pos_prompt_deltas=pos_prompt_deltas
+        )
         resized_images = torch.stack([self.resize_transform(x) for x in generated_images])
         normalized_images = self.normalize(resized_images).to(device)
         return normalized_images
 
-    def generate_pil_images(self, batch_size, pos_prompt: Union[str, List[str]], neg_prompt: Union[str, List[str]]):
+    def generate_pil_images(
+        self,
+        batch_size,
+        pos_prompt: Union[str, List[str]],
+        neg_prompt: Union[str, List[str]],
+        pos_prompt_deltas: Optional[List[torch.Tensor]] = None,
+    ):
         """Generate PIL images for saving or visualization."""
         with torch.no_grad():
-            generated_images = self.diffusion(batch_size, pos_prompt, neg_prompt)
+            generated_images = self.diffusion(
+                batch_size, pos_prompt, neg_prompt, pos_prompt_deltas=pos_prompt_deltas
+            )
             pil_images = []
             for img_tensor in generated_images:
                 img_tensor = img_tensor.detach().cpu().clamp(0, 1)
@@ -279,6 +431,11 @@ class DynamicPseudoUnknownGenerator:
         dynamic_batch_size: int = 3,
         near_far_ratio: Tuple[int, int] = (2, 1),
         enable_dynamic: bool = True,
+        attri_embed: Optional[torch.Tensor] = None,
+        mask_embed: Optional[torch.Tensor] = None,
+        class_to_attri_idx: Optional[Dict[str, int]] = None,
+        num_semantic_heads: int = 4,
+        offline_attri_alpha: float = 0.25,
     ):
         self.unknown_image_generator = unknown_image_generator
         self.prompt_pool = [p for p in prompt_pool if p]
@@ -287,6 +444,17 @@ class DynamicPseudoUnknownGenerator:
         self.dynamic_batch_size = dynamic_batch_size
         self.near_far_ratio = near_far_ratio
         self.enable_dynamic = enable_dynamic
+        self.attri_embed = attri_embed
+        self.mask_embed = mask_embed
+        self.class_to_attri_idx = class_to_attri_idx or {
+            name: idx for idx, name in enumerate(known_class_names)
+        }
+        self.offline_attri_alpha = offline_attri_alpha
+        self.semantic_prompt_builder = SemanticPromptBuilder(
+            embed_dim=512,
+            num_semantic_heads=num_semantic_heads,
+            sd_embed_dim=768,
+        ).to(device)
 
         self.far_semantic_hints = [
             "mechanical artifact",
@@ -362,13 +530,16 @@ class DynamicPseudoUnknownGenerator:
         farthest_pair_names = (center_names[i], center_names[j])
         return {"centers_tensor": centers_tensor, "farthest_pair_names": farthest_pair_names}
 
-    def build_dynamic_pos_prompts(self, domain_name: str, guide: Dict, batch_size: int) -> Tuple[List[str], List[str]]:
+    def build_dynamic_pos_prompts(
+        self, domain_name: str, guide: Dict, batch_size: int
+    ) -> Tuple[List[str], List[str], List[Union[str, Tuple[str, str], None]]]:
         near_weight, far_weight = self.near_far_ratio
         near_count = max(1, int(round(batch_size * near_weight / (near_weight + far_weight))))
         far_count = max(0, batch_size - near_count)
 
         prompts: List[str] = []
         modes: List[str] = []
+        anchors: List[Union[str, Tuple[str, str], None]] = []
         domain_phrase = domain_name.replace("_", " ")
 
         for _ in range(near_count):
@@ -376,6 +547,7 @@ class DynamicPseudoUnknownGenerator:
             cls_a = random.choice(self.known_class_names)
             prompts.append(f"{domain_phrase} blending {cls_a.replace('_', ' ')} and {base_prompt}")
             modes.append("near")
+            anchors.append(cls_a)
 
         far_a, far_b = guide.get("farthest_pair_names", random.sample(self.known_class_names, 2))
         for _ in range(far_count):
@@ -385,8 +557,9 @@ class DynamicPseudoUnknownGenerator:
                 f"{far_a.replace('_', ' ')} and {far_b.replace('_', ' ')}"
             )
             modes.append("far")
+            anchors.append((far_a, far_b))
 
-        return prompts, modes
+        return prompts, modes, anchors
 
     def build_dynamic_neg_prompts(self, modes: List[str], recent_known: List[str]) -> List[str]:
         terms = self._non_llm_negative_terms()
@@ -400,22 +573,113 @@ class DynamicPseudoUnknownGenerator:
                 negatives.append(f"{self.known_classes_text}, {sampled_known}".strip(", "))
         return negatives
 
-    def generate(self, model, known_images: torch.Tensor, known_labels: torch.Tensor, domain_name: str) -> Tuple[torch.Tensor, List[str], Dict]:
+    def _pool_offline_attribute(
+        self,
+        class_name: str,
+        attri_embed: torch.Tensor,
+        mask_embed: torch.Tensor,
+    ) -> Optional[torch.Tensor]:
+        class_idx = self.class_to_attri_idx.get(class_name)
+        if class_idx is None:
+            return None
+        if class_idx < 0 or class_idx >= attri_embed.shape[0]:
+            return None
+        attr_tokens = attri_embed[class_idx]  # [N, D]
+        attr_mask = mask_embed[class_idx] if mask_embed.dim() > 1 else None
+        if attr_mask is None:
+            return attr_tokens.mean(dim=0)
+        valid = (~attr_mask.bool()).unsqueeze(-1).to(attr_tokens.dtype)
+        denom = valid.sum(dim=0).clamp(min=1.0)
+        return (attr_tokens * valid).sum(dim=0) / denom
+
+    def _build_prompt_deltas(
+        self,
+        model,
+        known_images: torch.Tensor,
+        modes: List[str],
+        anchors: List[Union[str, Tuple[str, str], None]],
+        attri_embed: Optional[torch.Tensor],
+        mask_embed: Optional[torch.Tensor],
+    ) -> List[torch.Tensor]:
+        with torch.no_grad():
+            patch_features, global_features = model.get_patch_features(known_images)
+            semantic_tokens = self.semantic_prompt_builder.extract_semantic_tokens(patch_features)
+            semantic_tokens = self.semantic_prompt_builder.project_semantic_tokens(semantic_tokens)
+            domain_token = self.semantic_prompt_builder.project_domain_token(
+                global_features.mean(dim=0, keepdim=True)
+            )
+
+        base_tokens = semantic_tokens.mean(dim=0)  # [K, D]
+        deltas: List[torch.Tensor] = []
+        use_offline = attri_embed is not None and mask_embed is not None
+        for mode, anchor in zip(modes, anchors):
+            token_k = base_tokens.clone()
+            if mode == "far" and token_k.size(0) > 1:
+                token_k = token_k - token_k.roll(shifts=1, dims=0)
+
+            if use_offline:
+                offline_vec: Optional[torch.Tensor] = None
+                if isinstance(anchor, str):
+                    offline_vec = self._pool_offline_attribute(anchor, attri_embed, mask_embed)
+                elif isinstance(anchor, tuple):
+                    off_a = self._pool_offline_attribute(anchor[0], attri_embed, mask_embed)
+                    off_b = self._pool_offline_attribute(anchor[1], attri_embed, mask_embed)
+                    if off_a is not None and off_b is not None:
+                        offline_vec = 0.5 * (off_a + off_b)
+                    elif off_a is not None:
+                        offline_vec = off_a
+                    elif off_b is not None:
+                        offline_vec = off_b
+                if offline_vec is not None:
+                    token_k = (1 - self.offline_attri_alpha) * token_k + self.offline_attri_alpha * offline_vec.unsqueeze(0)
+
+            deltas.append(
+                self.semantic_prompt_builder.to_sd_prompt_delta(token_k, domain_token).detach()
+            )
+
+        return deltas
+
+    def generate(
+        self,
+        model,
+        known_images: torch.Tensor,
+        known_labels: torch.Tensor,
+        domain_name: str,
+        attri_embed: Optional[torch.Tensor] = None,
+        mask_embed: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, List[str], Dict]:
         batch_size = self.dynamic_batch_size if self.enable_dynamic else 1
         guide = self.compute_feature_space_guide(model, known_images, known_labels)
         recent_known = self._topk_known_class_names(known_labels, topk=3)
+        used_attri = attri_embed if attri_embed is not None else self.attri_embed
+        used_mask = mask_embed if mask_embed is not None else self.mask_embed
 
         if self.enable_dynamic:
             try:
-                pos_prompts, modes = self.build_dynamic_pos_prompts(domain_name, guide, batch_size)
+                pos_prompts, modes, anchors = self.build_dynamic_pos_prompts(domain_name, guide, batch_size)
                 neg_prompts = self.build_dynamic_neg_prompts(modes, recent_known)
-                generated = self.unknown_image_generator(batch_size, pos_prompts, neg_prompts)
+                prompt_deltas = self._build_prompt_deltas(
+                    model=model,
+                    known_images=known_images,
+                    modes=modes,
+                    anchors=anchors,
+                    attri_embed=used_attri,
+                    mask_embed=used_mask,
+                )
+                generated = self.unknown_image_generator(
+                    batch_size,
+                    pos_prompts,
+                    neg_prompts,
+                    pos_prompt_deltas=prompt_deltas,
+                )
                 return generated, modes, guide
             except Exception:
                 pass
 
         fallback_prompt = domain_name.replace("_", " ") + " of a " + random.choice(self.prompt_pool)
-        generated = self.unknown_image_generator(1, fallback_prompt, self.known_classes_text)
+        generated = self.unknown_image_generator(
+            1, fallback_prompt, self.known_classes_text, pos_prompt_deltas=None
+        )
         return generated, ["fallback"] * generated.shape[0], guide
 
     def update_distance_stats(self, model, selected_images: torch.Tensor, selected_modes: List[str], guide: Dict):
@@ -628,6 +892,19 @@ class CustomCLIP(nn.Module):
         image_features = F.normalize(image_features, dim=-1)
         image_features = self.prompt_mlp(image_features)
         return image_features
+
+    def get_patch_features(self, image: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Get patch tokens and global token from the latest visual layer."""
+        prompts, ctx = self.promptlearner()
+        _, layer_feat_list, _, _ = self.image_encoder(image.type(self.dtype), ctx)
+        if layer_feat_list:
+            patch_tokens = layer_feat_list[-1][:, 1:, :]
+        else:
+            image_features, _, _, _ = self.image_encoder(image.type(self.dtype), ctx)
+            patch_tokens = image_features.unsqueeze(1)
+        patch_tokens = F.normalize(patch_tokens, dim=-1)
+        global_features = patch_tokens.mean(dim=1)
+        return patch_tokens, global_features
     def forward(self, image: torch.Tensor, attri: torch.Tensor, mask_embed: torch.Tensor, 
                 label: torch.Tensor = None, dom_label: torch.Tensor = None, batch=None):
         """Forward pass with optional domain adaptation."""

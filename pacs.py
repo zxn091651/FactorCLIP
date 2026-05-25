@@ -255,7 +255,7 @@ for i in dirs_dom3:
 label_dom3=[2 for _ in range(len(image_path_dom3))]
 
 # Known Classes
-index_dom = list(set(index_dom1 + index_dom2 + index_dom3))
+index_dom = sorted(set(index_dom1 + index_dom2 + index_dom3))
 known_class_names = [class_names[idx] for idx in index_dom]
 known_classes = ",".join(known_class_names)
 
@@ -288,6 +288,7 @@ domain_prev = domain_prev.to(device)
 
 class_names.sort()
 train_prev_classnames = class_names[:6]
+class_to_attri_idx = {name: idx for idx, name in enumerate(train_prev_classnames)}
 
 image_filter = ImageFilter(brightness_threshold=0.01)
 
@@ -309,6 +310,8 @@ def train_epoch(model,params, dynamic_unknown_generator, domainnames, train_load
             known_images=img_prev,
             known_labels=label_prev,
             domain_name=domainnames[random_int],
+            attri_embed=attri_embed,
+            mask_embed=mask_embed,
         )
 
         unknown_label_rank = len(train_prev_classnames)
@@ -369,15 +372,23 @@ def train_epoch(model,params, dynamic_unknown_generator, domainnames, train_load
 
     return loss_meter, accuracy_meter.avg
 
-unknown_image_generator = GenerateUnknownImages().to(device)
+unknown_image_generator = GenerateUnknownImages(
+    semantic_heads=attri_embed.shape[1],
+    semantic_alpha=0.3,
+).to(device)
 dynamic_unknown_generator = DynamicPseudoUnknownGenerator(
     unknown_image_generator=unknown_image_generator,
     prompt_pool=prompt_list,
-    known_class_names=known_class_names,
+    known_class_names=train_prev_classnames,
     known_classes_text=known_classes,
     dynamic_batch_size=3,
     near_far_ratio=(2, 1),
     enable_dynamic=True,
+    attri_embed=attri_embed,
+    mask_embed=mask_embed,
+    class_to_attri_idx=class_to_attri_idx,
+    num_semantic_heads=attri_embed.shape[1],
+    offline_attri_alpha=0.2,
 )
 
 train_classnames = train_prev_classnames + ['unknown']
@@ -398,6 +409,7 @@ params = [
             {"params": train_model.promptlearner.parameters(),'lr' : config["prompt_lr"]},
             {"params": train_model.projector.parameters(),'lr' : config["projector_lr"]},
             {"params": train_model.cross_attention.parameters(),'lr' : config["cross_attention_lr"]},
+            {"params": dynamic_unknown_generator.semantic_prompt_builder.parameters(), 'lr': config["prompt_lr"]},
         ]
 optimizer = torch.optim.AdamW(params,  weight_decay=config["weight_decay"])
 # optimizer = torch.optim.SGD(params,momentum=0.9)
