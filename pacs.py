@@ -293,7 +293,6 @@ class_to_attri_idx = {name: idx for idx, name in enumerate(train_prev_classnames
 image_filter = ImageFilter(brightness_threshold=0.01)
 W_DOMAIN = 0.33
 W_ALIGN = 1.0
-W_ALIGN_PROMPT12 = 1.0
 W_SEMANTIC_CLS = 1.0
 W_REP = 0.5
 W_COH = 0.2
@@ -357,10 +356,8 @@ def train_epoch(model,params, dynamic_unknown_generator, domainnames, train_load
         )
 
         crossentropy_loss = (
-            F.cross_entropy(output, label)
-            + W_DOMAIN * loss_sty
+            W_DOMAIN * loss_sty
             + W_ALIGN * (1 - F.cosine_similarity(invariant, feat, dim=1)).mean()
-            + W_ALIGN_PROMPT12 * align_loss
             + W_SEMANTIC_CLS * semantic_cls_loss
             + W_REP * rep_loss
             + W_COH * coh_loss

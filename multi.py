@@ -383,6 +383,12 @@ domain_prev = domain_prev.to(device)
 
 # train_prev_classnames = class_names[:54]
 image_filter = ImageFilter(brightness_threshold=0.01)
+W_DOMAIN = 0.33
+W_ALIGN = 1.0
+W_SEMANTIC_CLS = 1.0
+W_REP = 0.5
+W_COH = 0.2
+
 def train_epoch(model,params, unknown_image_generator, domainnames, train_loader, optimizer, lr_scheduler, step,epoch):
     loss_meter = AvgMeter()
     accuracy_meter = AvgMeter()
@@ -432,14 +438,26 @@ def train_epoch(model,params, unknown_image_generator, domainnames, train_loader
         domain = domain.to(device)
         # with profile(with_flops=True) as prof:
 
-        output, loss_sty, invariant, feat, layer_loss = model(
+        (
+            output,
+            loss_sty,
+            invariant,
+            feat,
+            layer_loss,
+            align_loss,
+            semantic_cls_loss,
+            rep_loss,
+            coh_loss,
+        ) = model(
             img, attri_embed, mask_embed, label, domain, len(random_indices)
         )
 
         crossentropy_loss = (
-            F.cross_entropy(output, label)
-            + 0.33 * loss_sty
-            + (1 - F.cosine_similarity(invariant, feat, dim=1)).mean()
+            W_DOMAIN * loss_sty
+            + W_ALIGN * (1 - F.cosine_similarity(invariant, feat, dim=1)).mean()
+            + W_SEMANTIC_CLS * semantic_cls_loss
+            + W_REP * rep_loss
+            + W_COH * coh_loss
         )
     
         loss = crossentropy_loss 
