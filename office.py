@@ -370,7 +370,7 @@ def train_epoch(model,params, unknown_image_generator, domainnames, train_loader
 
         crossentropy_loss = (
             F.cross_entropy(output, label)
-            + 0.33 * (loss_sty + layer_loss)
+            + 0.33 * loss_sty
             + (1 - F.cosine_similarity(invariant, feat, dim=1)).mean()
         )
     

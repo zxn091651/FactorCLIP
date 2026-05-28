@@ -358,7 +358,7 @@ def train_epoch(model,params, dynamic_unknown_generator, domainnames, train_load
 
         crossentropy_loss = (
             F.cross_entropy(output, label)
-            + W_DOMAIN * (loss_sty + layer_loss)
+            + W_DOMAIN * loss_sty
             + W_ALIGN * (1 - F.cosine_similarity(invariant, feat, dim=1)).mean()
             + W_ALIGN_PROMPT12 * align_loss
             + W_SEMANTIC_CLS * semantic_cls_loss

@@ -1000,7 +1000,7 @@ class CustomCLIP(nn.Module):
 
         logit_scale = self.logit_scale.exp()
         # Main classifier: merge known semantic prompts + unknown prompt, then similarity.
-        semantic_logits_all, semantic_text_features = self._build_semantic_inference_logits(
+        semantic_logits_all, _ = self._build_semantic_inference_logits(
             image_features=image_features,
             layer_feat_list=layer_feat_list,
             dom_label=dom_label,
@@ -1008,41 +1008,9 @@ class CustomCLIP(nn.Module):
         )
 
         if dom_label is not None and batch is not None:
-            known_mask = (label < self.num_class - 1).float()
             known_count = image_features.size(0) - batch if batch is not None else image_features.size(0)
             unknown_count = image_features.size(0) - known_count
-
-            if layer_feat_list:
-                visual = self.image_encoder
-                num_patches = visual.positional_embedding.shape[0] - 1
-                layer_entropy_losses = []
-                for layer_tokens in layer_feat_list:
-                    layer_patch_tokens = layer_tokens[:, 1 : 1 + num_patches, :]
-                    layer_features = F.normalize(layer_patch_tokens.mean(dim=1), dim=-1)
-                    layer_logits = logit_scale * torch.einsum(
-                        "bd,bcd->bc", layer_features, semantic_text_features
-                    )
-                    probs_layer = torch.softmax(layer_logits, dim=-1)
-                    H_b_layer = -torch.sum(
-                        probs_layer * torch.log(probs_layer + 1e-10), dim=-1
-                    )
-                    if known_mask.sum() > 0:
-                        layer_entropy_losses.append(
-                            (H_b_layer * known_mask).sum() / known_mask.sum()
-                        )
-                if layer_entropy_losses:
-                    layer_loss = torch.stack(layer_entropy_losses).mean()
-                else:
-                    layer_loss = torch.zeros(
-                        (), device=image.device, dtype=image_features.dtype
-                    )
-            else:
-                probs_sem = torch.softmax(semantic_logits_all, dim=-1)
-                H_b = -torch.sum(probs_sem * torch.log(probs_sem + 1e-10), dim=-1)
-                if known_mask.sum() > 0:
-                    layer_loss = (H_b * known_mask).sum() / known_mask.sum()
-                else:
-                    layer_loss = torch.zeros((), device=image.device, dtype=H_b.dtype)
+            layer_loss = torch.zeros((), device=image.device, dtype=image_features.dtype)
             if layer_feat_list:
                 visual = self.image_encoder
                 num_patches = visual.positional_embedding.shape[0] - 1
