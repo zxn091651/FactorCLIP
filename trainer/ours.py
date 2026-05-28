@@ -1000,7 +1000,7 @@ class CustomCLIP(nn.Module):
 
         logit_scale = self.logit_scale.exp()
         # Main classifier: merge known semantic prompts + unknown prompt, then similarity.
-        semantic_logits_all = self._build_semantic_inference_logits(
+        semantic_logits_all, semantic_text_features = self._build_semantic_inference_logits(
             image_features=image_features,
             layer_feat_list=layer_feat_list,
             dom_label=dom_label,
@@ -1012,12 +1012,37 @@ class CustomCLIP(nn.Module):
             known_count = image_features.size(0) - batch if batch is not None else image_features.size(0)
             unknown_count = image_features.size(0) - known_count
 
-            probs_sem = torch.softmax(semantic_logits_all, dim=-1)
-            H_b = -torch.sum(probs_sem * torch.log(probs_sem + 1e-10), dim=-1)
-            if known_mask.sum() > 0:
-                layer_loss = (H_b * known_mask).sum() / known_mask.sum()
+            if layer_feat_list:
+                visual = self.image_encoder
+                num_patches = visual.positional_embedding.shape[0] - 1
+                layer_entropy_losses = []
+                for layer_tokens in layer_feat_list:
+                    layer_patch_tokens = layer_tokens[:, 1 : 1 + num_patches, :]
+                    layer_features = F.normalize(layer_patch_tokens.mean(dim=1), dim=-1)
+                    layer_logits = logit_scale * torch.einsum(
+                        "bd,bcd->bc", layer_features, semantic_text_features
+                    )
+                    probs_layer = torch.softmax(layer_logits, dim=-1)
+                    H_b_layer = -torch.sum(
+                        probs_layer * torch.log(probs_layer + 1e-10), dim=-1
+                    )
+                    if known_mask.sum() > 0:
+                        layer_entropy_losses.append(
+                            (H_b_layer * known_mask).sum() / known_mask.sum()
+                        )
+                if layer_entropy_losses:
+                    layer_loss = torch.stack(layer_entropy_losses).mean()
+                else:
+                    layer_loss = torch.zeros(
+                        (), device=image.device, dtype=image_features.dtype
+                    )
             else:
-                layer_loss = torch.zeros((), device=image.device, dtype=H_b.dtype)
+                probs_sem = torch.softmax(semantic_logits_all, dim=-1)
+                H_b = -torch.sum(probs_sem * torch.log(probs_sem + 1e-10), dim=-1)
+                if known_mask.sum() > 0:
+                    layer_loss = (H_b * known_mask).sum() / known_mask.sum()
+                else:
+                    layer_loss = torch.zeros((), device=image.device, dtype=H_b.dtype)
             if layer_feat_list:
                 visual = self.image_encoder
                 num_patches = visual.positional_embedding.shape[0] - 1
@@ -1229,7 +1254,7 @@ class CustomCLIP(nn.Module):
         layer_feat_list: List[torch.Tensor],
         dom_label: Optional[torch.Tensor],
         logit_scale: torch.Tensor,
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Inference head based on prompt-(2) and prompt-(3):
         compute similarity between high-level image embedding and
@@ -1248,6 +1273,7 @@ class CustomCLIP(nn.Module):
         patch_tokens = F.normalize(patch_tokens, dim=-1)
 
         semantic_logits_list = []
+        semantic_text_features_list = []
         for i in range(batch_size):
             tokenized_prompts = torch.cat(
                 [clip.tokenize(p.replace("_", " ")) for p in self.classnames[:-1]]
@@ -1276,8 +1302,12 @@ class CustomCLIP(nn.Module):
             )  # [C+1, D]
             semantic_logits = logit_scale * (image_features[i] @ semantic_proto.t())
             semantic_logits_list.append(semantic_logits)
+            semantic_text_features_list.append(semantic_proto)
 
-        return torch.stack(semantic_logits_list, dim=0)
+        return (
+            torch.stack(semantic_logits_list, dim=0),
+            torch.stack(semantic_text_features_list, dim=0),
+        )
 
     def _process_domain_features(
         self,
