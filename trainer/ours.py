@@ -157,19 +157,51 @@ class TextEncoder(nn.Module):
 class SemanticTokenExtractor(nn.Module):
     """Extract K semantic tokens from patch embeddings."""
 
-    def __init__(self, embed_dim: int = 512, num_semantic_heads: int = 4):
+    def __init__(
+        self,
+        embed_dim: int = 512,
+        num_semantic_heads: int = 4,
+        num_known_classes: int = 1,
+    ):
         super().__init__()
         self.embed_dim = embed_dim
         self.num_semantic_heads = num_semantic_heads
-        self.query_vectors = nn.Parameter(torch.randn(num_semantic_heads, embed_dim))
+        self.num_known_classes = max(1, num_known_classes)
+        # Per-class query bank: [C, K, D].
+        self.query_vectors = nn.Parameter(
+            torch.randn(self.num_known_classes, num_semantic_heads, embed_dim)
+        )
         nn.init.normal_(self.query_vectors, std=0.02)
 
-    def forward(self, patch_embeddings: torch.Tensor) -> torch.Tensor:
+    def _extract_all_class_tokens(self, patch_embeddings: torch.Tensor) -> torch.Tensor:
         """
         Args:
             patch_embeddings: [B, N, D]
         Returns:
-            semantic tokens: [B, K, D]
+            semantic tokens for all classes: [B, C, K, D]
+        """
+        attention_scores = torch.einsum(
+            "bnd,ckd->bckn", patch_embeddings, self.query_vectors
+        )  # [B, C, K, N]
+        attention_weights = F.softmax(attention_scores, dim=-1)
+        semantic_tokens = torch.einsum(
+            "bckn,bnd->bckd", attention_weights, patch_embeddings
+        )  # [B, C, K, D]
+        return semantic_tokens
+
+    def forward(
+        self,
+        patch_embeddings: torch.Tensor,
+        class_indices: Optional[torch.Tensor] = None,
+        return_all_classes: bool = False,
+    ) -> torch.Tensor:
+        """
+        Args:
+            patch_embeddings: [B, N, D]
+            class_indices: optional [B] class indices for per-sample selection.
+            return_all_classes: if True, returns [B, C, K, D].
+        Returns:
+            [B, K, D] (default), or [B, C, K, D] if return_all_classes=True.
         """
         if patch_embeddings.dim() != 3:
             raise ValueError("patch_embeddings must be [B, N, D]")
@@ -177,14 +209,20 @@ class SemanticTokenExtractor(nn.Module):
         patch_embeddings = patch_embeddings.to(
             device=self.query_vectors.device, dtype=self.query_vectors.dtype
         )
-
-        semantic_tokens: List[torch.Tensor] = []
-        for k in range(self.num_semantic_heads):
-            attention_scores = torch.matmul(patch_embeddings, self.query_vectors[k])  # [B, N]
-            attention_weights = F.softmax(attention_scores, dim=1)
-            token_k = torch.sum(attention_weights.unsqueeze(-1) * patch_embeddings, dim=1)  # [B, D]
-            semantic_tokens.append(token_k)
-        return torch.stack(semantic_tokens, dim=1)
+        semantic_tokens_all = self._extract_all_class_tokens(patch_embeddings)
+        if return_all_classes:
+            return semantic_tokens_all
+        if class_indices is None:
+            # Keep compatibility for code paths without explicit class anchors.
+            return semantic_tokens_all.mean(dim=1)
+        if class_indices.dim() != 1 or class_indices.size(0) != patch_embeddings.size(0):
+            raise ValueError("class_indices must be shape [B]")
+        class_indices = class_indices.to(device=semantic_tokens_all.device, dtype=torch.long)
+        class_indices = class_indices.clamp(0, self.num_known_classes - 1)
+        batch_idx = torch.arange(
+            patch_embeddings.size(0), device=semantic_tokens_all.device
+        )
+        return semantic_tokens_all[batch_idx, class_indices]
 
 
 class SemanticPromptBuilder(nn.Module):
@@ -195,12 +233,15 @@ class SemanticPromptBuilder(nn.Module):
         embed_dim: int = 512,
         num_semantic_heads: int = 4,
         sd_embed_dim: int = 768,
+        num_known_classes: int = 1,
     ):
         super().__init__()
         self.embed_dim = embed_dim
         self.num_semantic_heads = num_semantic_heads
         self.semantic_extractor = SemanticTokenExtractor(
-            embed_dim=embed_dim, num_semantic_heads=num_semantic_heads
+            embed_dim=embed_dim,
+            num_semantic_heads=num_semantic_heads,
+            num_known_classes=num_known_classes,
         )
         self.domain_projection = nn.Linear(embed_dim, embed_dim)
         self.semantic_projections = nn.ModuleList(
@@ -208,16 +249,37 @@ class SemanticPromptBuilder(nn.Module):
         )
         self.sd_projection = nn.Linear(embed_dim, sd_embed_dim)
 
-    def extract_semantic_tokens(self, patch_embeddings: torch.Tensor) -> torch.Tensor:
-        return self.semantic_extractor(patch_embeddings)
+    def extract_semantic_tokens(
+        self,
+        patch_embeddings: torch.Tensor,
+        class_indices: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        return self.semantic_extractor(
+            patch_embeddings, class_indices=class_indices, return_all_classes=False
+        )
+
+    def extract_semantic_tokens_all_classes(
+        self,
+        patch_embeddings: torch.Tensor,
+    ) -> torch.Tensor:
+        return self.semantic_extractor(
+            patch_embeddings, class_indices=None, return_all_classes=True
+        )
 
     def project_semantic_tokens(self, semantic_tokens: torch.Tensor) -> torch.Tensor:
-        if semantic_tokens.dim() != 3:
-            raise ValueError("semantic_tokens must be [B, K, D]")
-        projected = []
-        for k in range(self.num_semantic_heads):
-            projected.append(self.semantic_projections[k](semantic_tokens[:, k, :]))
-        return torch.stack(projected, dim=1)
+        if semantic_tokens.dim() == 3:
+            # [B, K, D] -> [B, K, D]
+            projected = []
+            for k in range(self.num_semantic_heads):
+                projected.append(self.semantic_projections[k](semantic_tokens[:, k, :]))
+            return torch.stack(projected, dim=1)
+        if semantic_tokens.dim() == 4:
+            # [B, C, K, D] -> [B, C, K, D]
+            projected = []
+            for k in range(self.num_semantic_heads):
+                projected.append(self.semantic_projections[k](semantic_tokens[:, :, k, :]))
+            return torch.stack(projected, dim=2)
+        raise ValueError("semantic_tokens must be [B, K, D] or [B, C, K, D]")
 
     def project_domain_token(self, global_features: torch.Tensor) -> torch.Tensor:
         if global_features.dim() != 2:
@@ -598,17 +660,54 @@ class DynamicPseudoUnknownGenerator:
         prompt2_builder = model.class_semantic_builder
         with torch.no_grad():
             patch_features, global_features = model.get_patch_features(known_images)
-            semantic_tokens = prompt2_builder.extract_semantic_tokens(patch_features)
-            semantic_tokens = prompt2_builder.project_semantic_tokens(semantic_tokens)
+            semantic_tokens_all = prompt2_builder.extract_semantic_tokens_all_classes(
+                patch_features
+            )  # [B, C, K, D]
+            semantic_tokens_all = prompt2_builder.project_semantic_tokens(
+                semantic_tokens_all
+            )  # [B, C, K, D]
             domain_token = prompt2_builder.project_domain_token(
                 global_features.mean(dim=0, keepdim=True)
             )
 
-        base_tokens = semantic_tokens.mean(dim=0)  # [K, D]
+        # Average over batch to obtain class-specific semantic tokens: [C, K, D].
+        base_tokens_per_class = semantic_tokens_all.mean(dim=0)
         deltas: List[torch.Tensor] = []
         use_offline = attri_embed is not None and mask_embed is not None
+        known_class_to_idx = {
+            cls_name: idx for idx, cls_name in enumerate(self.known_class_names)
+        }
         for mode, anchor in zip(modes, anchors):
-            token_k = base_tokens.clone()
+            if isinstance(anchor, str):
+                cls_idx = known_class_to_idx.get(anchor, None)
+                if cls_idx is not None and 0 <= cls_idx < base_tokens_per_class.size(0):
+                    token_k = base_tokens_per_class[cls_idx].clone()
+                else:
+                    token_k = base_tokens_per_class.mean(dim=0).clone()
+            elif isinstance(anchor, tuple):
+                idx_a = known_class_to_idx.get(anchor[0], None)
+                idx_b = known_class_to_idx.get(anchor[1], None)
+                token_a = (
+                    base_tokens_per_class[idx_a]
+                    if idx_a is not None and 0 <= idx_a < base_tokens_per_class.size(0)
+                    else None
+                )
+                token_b = (
+                    base_tokens_per_class[idx_b]
+                    if idx_b is not None and 0 <= idx_b < base_tokens_per_class.size(0)
+                    else None
+                )
+                if token_a is not None and token_b is not None:
+                    token_k = 0.5 * (token_a + token_b)
+                elif token_a is not None:
+                    token_k = token_a.clone()
+                elif token_b is not None:
+                    token_k = token_b.clone()
+                else:
+                    token_k = base_tokens_per_class.mean(dim=0).clone()
+            else:
+                token_k = base_tokens_per_class.mean(dim=0).clone()
+
             if mode == "far" and token_k.size(0) > 1:
                 token_k = token_k - token_k.roll(shifts=1, dims=0)
 
@@ -810,6 +909,7 @@ class CustomCLIP(nn.Module):
             embed_dim=512,
             num_semantic_heads=max(1, self.ctx - 1),
             sd_embed_dim=768,
+            num_known_classes=max(1, len(classnames) - 1),
         )
         # Prompt-3 learnable semantic tokens [v_1 ... v_m], independent from prompt-2.
         unknown_ctx_len = max(0, self.ctx - 1)
@@ -823,10 +923,56 @@ class CustomCLIP(nn.Module):
         self.num_class = len(classnames)
         self.classnames = classnames
         self.domainnames = domainnames
+        self.num_domains = len(domainnames)
         self.gated = gated
         self.rep_margin = 0.2
+        self.register_buffer("domain_feature_sum", torch.zeros(self.num_domains, 512))
+        self.register_buffer("domain_feature_count", torch.zeros(self.num_domains))
         # Cache latest unknown-class prompt embeddings for external training losses.
         self.latest_unknown_prompt_embeddings: Optional[torch.Tensor] = None
+
+    @torch.no_grad()
+    def _update_domain_feature_bank(
+        self, global_features: torch.Tensor, domain_ids: Optional[torch.Tensor]
+    ) -> None:
+        if domain_ids is None or global_features.numel() == 0:
+            return
+        if domain_ids.dim() != 1:
+            domain_ids = domain_ids.view(-1)
+        domain_ids = domain_ids.to(device=global_features.device, dtype=torch.long)
+        domain_ids = domain_ids.clamp(min=0, max=max(0, self.num_domains - 1))
+        for domain_id_t in torch.unique(domain_ids):
+            domain_id = int(domain_id_t.item())
+            mask = domain_ids == domain_id
+            if not mask.any():
+                continue
+            self.domain_feature_sum[domain_id] += global_features[mask].detach().sum(dim=0)
+            self.domain_feature_count[domain_id] += mask.sum().to(
+                dtype=self.domain_feature_count.dtype
+            )
+
+    def _resolve_domain_mean_features(
+        self, global_features: torch.Tensor, domain_ids: Optional[torch.Tensor]
+    ) -> torch.Tensor:
+        if domain_ids is None or global_features.numel() == 0:
+            return global_features
+        if domain_ids.dim() != 1:
+            domain_ids = domain_ids.view(-1)
+        domain_ids = domain_ids.to(device=global_features.device, dtype=torch.long)
+        domain_ids = domain_ids.clamp(min=0, max=max(0, self.num_domains - 1))
+        out = global_features.clone()
+        for domain_id_t in torch.unique(domain_ids):
+            domain_id = int(domain_id_t.item())
+            count = self.domain_feature_count[domain_id]
+            if count <= 0:
+                continue
+            domain_mean = self.domain_feature_sum[domain_id] / count
+            matched_idx = torch.nonzero(domain_ids == domain_id, as_tuple=False).squeeze(1)
+            if matched_idx.numel() == 0:
+                continue
+            fill = domain_mean.unsqueeze(0).expand(matched_idx.numel(), -1)
+            out.index_copy_(0, matched_idx, fill)
+        return out
 
     def get_image_features(self, image: torch.Tensor) -> torch.Tensor:
         """Extract image features without CoOp context."""
@@ -957,6 +1103,7 @@ class CustomCLIP(nn.Module):
         patch_tokens: torch.Tensor,
         global_features: torch.Tensor,
         tokenized_prompts: torch.Tensor,
+        domain_ids: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Build prompt-2 embeddings with structure:
@@ -968,32 +1115,43 @@ class CustomCLIP(nn.Module):
         with torch.no_grad():
             base_embedding = clip_model.token_embedding(tokenized_prompts).type(self.dtype)
 
-        ctx_tokens = self._build_dom_semantic_ctx_tokens(patch_tokens, global_features)
+        ctx_tokens = self._build_dom_semantic_ctx_tokens(
+            patch_tokens, global_features, domain_ids=domain_ids
+        )
         return self._encode_prompts_with_ctx(base_embedding, tokenized_prompts, ctx_tokens)
 
     def _build_dom_semantic_ctx_tokens(
-        self, patch_tokens: torch.Tensor, global_features: torch.Tensor
+        self,
+        patch_tokens: torch.Tensor,
+        global_features: torch.Tensor,
+        domain_ids: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Build ctx tokens for prompt-2:
         [dom] + [v_sem^1 ... v_sem^m].
         """
-        semantic_tokens = self.class_semantic_builder.extract_semantic_tokens(patch_tokens)
+        semantic_tokens = self.class_semantic_builder.extract_semantic_tokens_all_classes(
+            patch_tokens
+        )
         semantic_tokens = self.class_semantic_builder.project_semantic_tokens(semantic_tokens)
-        domain_token = self.class_semantic_builder.project_domain_token(global_features)
+        self._update_domain_feature_bank(global_features, domain_ids)
+        domain_mean_features = self._resolve_domain_mean_features(global_features, domain_ids)
+        domain_token = self.class_semantic_builder.project_domain_token(domain_mean_features)
 
         batch_size = patch_tokens.size(0)
+        num_known_cls = self.num_class - 1
         ctx_tokens = torch.zeros(
             batch_size,
+            num_known_cls,
             self.ctx,
             semantic_tokens.size(-1),
             device=patch_tokens.device,
             dtype=semantic_tokens.dtype,
         )
-        ctx_tokens[:, 0, :] = domain_token
+        ctx_tokens[:, :, 0, :] = domain_token.unsqueeze(1)
         if self.ctx > 1 and semantic_tokens.size(1) > 0:
-            use_k = min(self.ctx - 1, semantic_tokens.size(1))
-            ctx_tokens[:, 1 : 1 + use_k, :] = semantic_tokens[:, :use_k, :]
+            use_k = min(self.ctx - 1, semantic_tokens.size(2))
+            ctx_tokens[:, :, 1 : 1 + use_k, :] = semantic_tokens[:, :, :use_k, :]
         return ctx_tokens
 
     def _build_unknown_learnable_ctx_tokens(
@@ -1033,7 +1191,13 @@ class CustomCLIP(nn.Module):
         batch_size = ctx_tokens.size(0)
         for i in range(batch_size):
             embedding_copy = base_embedding.clone()
-            embedding_copy[:, token_start:token_end, :] += ctx_tokens[i].unsqueeze(0).to(
+            if ctx_tokens.dim() == 3:
+                ctx_i = ctx_tokens[i].unsqueeze(0)
+            elif ctx_tokens.dim() == 4:
+                ctx_i = ctx_tokens[i]
+            else:
+                raise ValueError("ctx_tokens must be [B, ctx, D] or [B, C, ctx, D]")
+            embedding_copy[:, token_start:token_end, :] += ctx_i.to(
                 device=embedding_copy.device, dtype=embedding_copy.dtype
             )
             embedding_int = self.text_encoder(embedding_copy, tokenized_prompts)
@@ -1094,10 +1258,12 @@ class CustomCLIP(nn.Module):
 
             sample_patch_tokens = patch_tokens[i : i + 1]
             sample_global_features = image_features[i : i + 1]
+            sample_domain_ids = dom_label[i : i + 1] if dom_label is not None else None
             semantic_prompt_embeddings = self._build_class_semantic_prompt_embeddings(
                 patch_tokens=sample_patch_tokens,
                 global_features=sample_global_features,
                 tokenized_prompts=tokenized_prompts,
+                domain_ids=sample_domain_ids,
             )[0]  # [C, D]
             unknown_prompt_embedding = self._build_unknown_semantic_prompt_embeddings(
                 patch_tokens=sample_patch_tokens,
@@ -1209,6 +1375,12 @@ class CustomCLIP(nn.Module):
                 patch_tokens=domain_patch_tokens,
                 global_features=domain_features,
                 tokenized_prompts=tokenized_prompts,
+                domain_ids=torch.full(
+                    (domain_features.size(0),),
+                    domain,
+                    device=device,
+                    dtype=torch.long,
+                ),
             )
             unknown_prompt_embeddings = self._build_unknown_semantic_prompt_embeddings(
                 patch_tokens=domain_patch_tokens,
