@@ -19,7 +19,6 @@ from torchvision.transforms.functional import to_pil_image
 
 # CLIP and Diffusion imports
 from clip import clip
-from clip.simple_tokenizer import SimpleTokenizer as _Tokenizer
 from transformers import CLIPTextModel, CLIPTokenizer, CLIPModel, CLIPVisionModel, CLIPImageProcessor
 from diffusers import (
     StableDiffusionPipeline, 
@@ -61,7 +60,6 @@ torch.use_deterministic_algorithms(True, warn_only=True)
 os.environ['CUBLAS_WORKSPACE_CONFIG'] = ':4096:8'
 # Initialize global components
 device = "cuda" if torch.cuda.is_available() else "cpu"
-_tokenizer = _Tokenizer()
 clip_model, clip_preprocess = clip.load("ViT-B/32", device=device)
 # clip_model, clip_preprocess = clip.load("./weights/ViT-B-32.pt", device=device)
 
@@ -450,11 +448,6 @@ class DynamicPseudoUnknownGenerator:
             name: idx for idx, name in enumerate(known_class_names)
         }
         self.offline_attri_alpha = offline_attri_alpha
-        self.semantic_prompt_builder = SemanticPromptBuilder(
-            embed_dim=512,
-            num_semantic_heads=num_semantic_heads,
-            sd_embed_dim=768,
-        ).to(device)
 
         self.far_semantic_hints = [
             "mechanical artifact",
@@ -601,11 +594,13 @@ class DynamicPseudoUnknownGenerator:
         attri_embed: Optional[torch.Tensor],
         mask_embed: Optional[torch.Tensor],
     ) -> List[torch.Tensor]:
+        # Reuse Prompt-(2) semantic builder from the training model.
+        prompt2_builder = model.class_semantic_builder
         with torch.no_grad():
             patch_features, global_features = model.get_patch_features(known_images)
-            semantic_tokens = self.semantic_prompt_builder.extract_semantic_tokens(patch_features)
-            semantic_tokens = self.semantic_prompt_builder.project_semantic_tokens(semantic_tokens)
-            domain_token = self.semantic_prompt_builder.project_domain_token(
+            semantic_tokens = prompt2_builder.extract_semantic_tokens(patch_features)
+            semantic_tokens = prompt2_builder.project_semantic_tokens(semantic_tokens)
+            domain_token = prompt2_builder.project_domain_token(
                 global_features.mean(dim=0, keepdim=True)
             )
 
@@ -634,7 +629,7 @@ class DynamicPseudoUnknownGenerator:
                     token_k = (1 - self.offline_attri_alpha) * token_k + self.offline_attri_alpha * offline_vec.unsqueeze(0)
 
             deltas.append(
-                self.semantic_prompt_builder.to_sd_prompt_delta(token_k, domain_token).detach()
+                prompt2_builder.to_sd_prompt_delta(token_k, domain_token).detach()
             )
 
         return deltas
@@ -789,80 +784,16 @@ class AttFlat(nn.Module):
         return x_atted
 
 
-class PromptLearner(nn.Module):
-    """Learnable prompt generation for CLIP."""
-    
-    def __init__(self, classnames, clip_model, n_ctx, config,project=False):
-        super().__init__()
-        # seed_everything(42)
-        self.n_cls = len(classnames)
-        self.n_ctx = n_ctx
-        dtype = clip_model.dtype
-        ctx_dim = clip_model.ln_final.weight.shape[0]
-        
-       
-        ctx_vectors = torch.empty(n_ctx - 2, 768, dtype=dtype)
-        nn.init.normal_(ctx_vectors, std=0.02)
-        
-        ctx_vectors_unk = torch.empty(2, ctx_dim, dtype=dtype)
-        nn.init.normal_(ctx_vectors_unk, std=0.02)
-        
-        if project:
-            self.prompt_cls = nn.Sequential(
-                nn.Linear(768, config["project_dim"]),
-                nn.GELU(),
-                nn.Dropout(p=config["dropout"]),
-                nn.Linear(config["project_dim"], ctx_dim)
-            )
-        else:
-            self.prompt_cls = nn.Sequential(
-                                nn.Linear(768, ctx_dim)
-                            )
-        self.ctx = nn.Parameter(ctx_vectors)
-        self.ctx_k = nn.Parameter(ctx_vectors_unk)
-        
-        
-        classnames = [name.replace("_", " ") for name in classnames]
-        name_lens = [len(_tokenizer.encode(name)) for name in classnames]
-        prompt_prefix = " ".join(["X"] * n_ctx)
-        prompts = [f"{prompt_prefix} {name}." for name in classnames]
-        
-        tokenized_prompts = torch.cat([clip.tokenize(p) for p in prompts])
-        with torch.no_grad():
-            embedding = clip_model.token_embedding(tokenized_prompts).type(dtype)
-        
-        self.register_buffer("token_prefix", embedding[:, :1, :])
-        self.register_buffer("token_suffix", embedding[:, 1 + n_ctx:, :])
-        self.tokenized_prompts = tokenized_prompts
-        self.name_lens = name_lens
-
-    def construct_prompts(self, ctx, prefix, suffix, label=None):
-        """Construct prompts by combining context with prefix and suffix."""
-        if label is not None:
-            prefix = prefix[label]
-            suffix = suffix[label]
-        
-        prompts = torch.cat([prefix, ctx, suffix], dim=1)
-        return prompts
-
-    def forward(self):
-        """Generate learnable prompts."""
-        ctx = self.prompt_cls(self.ctx)
-        ctx = torch.cat((self.ctx_k, ctx), dim=0)
-        ctx = ctx.unsqueeze(0).expand(self.n_cls, -1, -1)
-        
-        prompts = self.construct_prompts(ctx, self.token_prefix, self.token_suffix)
-        return prompts, self.ctx
 class CustomCLIP(nn.Module):
-    """Custom CLIP model with prompt learning and style adaptation."""
+    """Custom CLIP model with semantic prompting and style adaptation."""
     
     def __init__(self, classnames: List[str], domainnames: List[str], clip_model: nn.Module, config, gated=False,project=False):
         super().__init__()
         # seed_everything(42)
         self.ctx = config["n_ctx"]
+        self.dtype = clip_model.dtype
         self.image_encoder = clip_model.visual
         self.text_encoder = TextEncoder(clip_model)
-        self.promptlearner = PromptLearner(classnames, clip_model, self.ctx, config,project=project)
         
         
         self.prompt_mlp = nn.Sequential(
@@ -880,11 +811,15 @@ class CustomCLIP(nn.Module):
             num_semantic_heads=max(1, self.ctx - 1),
             sd_embed_dim=768,
         )
+        # Prompt-3 learnable semantic tokens [v_1 ... v_m], independent from prompt-2.
+        unknown_ctx_len = max(0, self.ctx - 1)
+        self.unknown_prompt_ctx = nn.Parameter(torch.empty(unknown_ctx_len, 512))
+        if unknown_ctx_len > 0:
+            nn.init.normal_(self.unknown_prompt_ctx, std=0.02)
         # self.projector = nn.Identity()
         
       
         self.logit_scale = clip_model.logit_scale
-        self.dtype = clip_model.dtype
         self.num_class = len(classnames)
         self.classnames = classnames
         self.domainnames = domainnames
@@ -894,21 +829,19 @@ class CustomCLIP(nn.Module):
         self.latest_unknown_prompt_embeddings: Optional[torch.Tensor] = None
 
     def get_image_features(self, image: torch.Tensor) -> torch.Tensor:
-        """Extract image features with prompt conditioning."""
-        prompts, ctx = self.promptlearner()
-        image_features, layer_feat_list, _, _ = self.image_encoder(image.type(self.dtype), ctx)
+        """Extract image features without CoOp context."""
+        image_features, _, _, _ = self.image_encoder(image.type(self.dtype))
         image_features = F.normalize(image_features, dim=-1)
         image_features = self.prompt_mlp(image_features)
         return image_features
 
     def get_patch_features(self, image: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """Get patch tokens and global token from the latest visual layer."""
-        prompts, ctx = self.promptlearner()
-        _, layer_feat_list, _, _ = self.image_encoder(image.type(self.dtype), ctx)
+        _, layer_feat_list, _, _ = self.image_encoder(image.type(self.dtype))
         if layer_feat_list:
             patch_tokens = layer_feat_list[-1][:, 1:, :]
         else:
-            image_features, _, _, _ = self.image_encoder(image.type(self.dtype), ctx)
+            image_features, _, _, _ = self.image_encoder(image.type(self.dtype))
             patch_tokens = image_features.unsqueeze(1)
         patch_tokens = F.normalize(patch_tokens, dim=-1)
         global_features = patch_tokens.mean(dim=1)
@@ -916,49 +849,32 @@ class CustomCLIP(nn.Module):
     def forward(self, image: torch.Tensor, attri: torch.Tensor, mask_embed: torch.Tensor, 
                 label: torch.Tensor = None, dom_label: torch.Tensor = None, batch=None):
         """Forward pass with optional domain adaptation."""
-        prompts, ctx = self.promptlearner()
-        image_features, layer_feat_list, _, _ = self.image_encoder(image.type(self.dtype), ctx)
+        image_features, layer_feat_list, _, _ = self.image_encoder(image.type(self.dtype))
         image_features = F.normalize(image_features, dim=-1)
-        
-        
-        prompt_prefix = " ".join(["X"] * self.ctx)
-        tokenized_prompts = torch.cat([
-            clip.tokenize(f"{prompt_prefix} {p}") for p in self.classnames
-        ]).to(image.device)
-        
-   
-        text_features = self.text_encoder(prompts, tokenized_prompts)
-        text_features = F.normalize(text_features, dim=-1)
 
- 
         logit_scale = self.logit_scale.exp()
-        logits = logit_scale * image_features @ text_features.t()
+        # Main classifier: merge known semantic prompts + unknown prompt, then similarity.
+        semantic_logits_all = self._build_semantic_inference_logits(
+            image_features=image_features,
+            layer_feat_list=layer_feat_list,
+            dom_label=dom_label,
+            logit_scale=logit_scale,
+        )
 
         if dom_label is not None and batch is not None:
-            visual = self.image_encoder
-            num_patches = visual.positional_embedding.shape[0] - 1
             known_mask = (label < self.num_class - 1).float()
             known_count = image_features.size(0) - batch if batch is not None else image_features.size(0)
             unknown_count = image_features.size(0) - known_count
 
-            entropy_layer_terms = []
-            for layer_feat in layer_feat_list:
-                patch_mean = layer_feat[:, 1 : 1 + num_patches, :].mean(dim=1)
-                patch_mean = F.normalize(patch_mean, dim=-1)
-                logits_pm = logit_scale * (patch_mean @ text_features.t())
-                probs = torch.softmax(logits_pm, dim=-1)
-                H_b = -torch.sum(probs * torch.log(probs + 1e-10), dim=-1)
-                if known_mask.sum() > 0:
-                    entropy_layer_terms.append((H_b * known_mask).sum() / known_mask.sum())
-                else:
-                    entropy_layer_terms.append(
-                        torch.zeros((), device=image.device, dtype=H_b.dtype)
-                    )
-
-            layer_loss = torch.stack(entropy_layer_terms).mean()
-
-            txt_features = text_features[:-1, :].repeat(known_count, 1)
+            probs_sem = torch.softmax(semantic_logits_all, dim=-1)
+            H_b = -torch.sum(probs_sem * torch.log(probs_sem + 1e-10), dim=-1)
+            if known_mask.sum() > 0:
+                layer_loss = (H_b * known_mask).sum() / known_mask.sum()
+            else:
+                layer_loss = torch.zeros((), device=image.device, dtype=H_b.dtype)
             if layer_feat_list:
+                visual = self.image_encoder
+                num_patches = visual.positional_embedding.shape[0] - 1
                 known_patch_tokens = layer_feat_list[-1][:known_count, 1 : 1 + num_patches, :]
                 low_level_known_features = layer_feat_list[0][:known_count, 1 : 1 + num_patches, :].mean(dim=1)
                 low_level_known_features = F.normalize(low_level_known_features, dim=-1)
@@ -1023,9 +939,9 @@ class CustomCLIP(nn.Module):
 
             self.latest_unknown_prompt_embeddings = unknown_prompt_embedding
             return (
-                logits,
+                semantic_logits_all,
                 loss_sty,
-                txt_features,
+                domain_prompt_embeddings,
                 semantic_prompt_embeddings,
                 layer_loss,
                 align_loss,
@@ -1035,13 +951,7 @@ class CustomCLIP(nn.Module):
             )
         else:
             self.latest_unknown_prompt_embeddings = None
-            semantic_logits = self._build_semantic_inference_logits(
-                image_features=image_features,
-                layer_feat_list=layer_feat_list,
-                dom_label=dom_label,
-                logit_scale=logit_scale,
-            )
-            return semantic_logits, image_features
+            return semantic_logits_all, image_features
     def _build_class_semantic_prompt_embeddings(
         self,
         patch_tokens: torch.Tensor,
@@ -1065,7 +975,7 @@ class CustomCLIP(nn.Module):
         self, patch_tokens: torch.Tensor, global_features: torch.Tensor
     ) -> torch.Tensor:
         """
-        Build ctx tokens shared by prompt-2/prompt-3:
+        Build ctx tokens for prompt-2:
         [dom] + [v_sem^1 ... v_sem^m].
         """
         semantic_tokens = self.class_semantic_builder.extract_semantic_tokens(patch_tokens)
@@ -1084,6 +994,31 @@ class CustomCLIP(nn.Module):
         if self.ctx > 1 and semantic_tokens.size(1) > 0:
             use_k = min(self.ctx - 1, semantic_tokens.size(1))
             ctx_tokens[:, 1 : 1 + use_k, :] = semantic_tokens[:, :use_k, :]
+        return ctx_tokens
+
+    def _build_unknown_learnable_ctx_tokens(
+        self, global_features: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Build prompt-3 ctx tokens:
+        [dom] + [v_1 ... v_m], where [v_1 ... v_m] are independent learnable tokens.
+        """
+        domain_token = self.class_semantic_builder.project_domain_token(global_features)
+        batch_size = global_features.size(0)
+        ctx_tokens = torch.zeros(
+            batch_size,
+            self.ctx,
+            domain_token.size(-1),
+            device=global_features.device,
+            dtype=domain_token.dtype,
+        )
+        ctx_tokens[:, 0, :] = domain_token
+        if self.ctx > 1 and self.unknown_prompt_ctx.numel() > 0:
+            learnable_ctx = self.unknown_prompt_ctx.to(
+                device=global_features.device, dtype=domain_token.dtype
+            )
+            use_k = min(self.ctx - 1, learnable_ctx.size(0))
+            ctx_tokens[:, 1 : 1 + use_k, :] = learnable_ctx[:use_k, :].unsqueeze(0)
         return ctx_tokens
 
     def _encode_prompts_with_ctx(
@@ -1117,7 +1052,7 @@ class CustomCLIP(nn.Module):
         """
         with torch.no_grad():
             base_embedding = clip_model.token_embedding(tokenized_unknown_prompt).type(self.dtype)
-        ctx_tokens = self._build_dom_semantic_ctx_tokens(patch_tokens, global_features)
+        ctx_tokens = self._build_unknown_learnable_ctx_tokens(global_features)
         unknown_prompt_embeddings = self._encode_prompts_with_ctx(
             base_embedding, tokenized_unknown_prompt, ctx_tokens
         )
@@ -1139,7 +1074,6 @@ class CustomCLIP(nn.Module):
         device = image_features.device
         batch_size = image_features.size(0)
         known_cls = self.num_class - 1
-        domain_count = max(1, len(self.domainnames))
 
         if layer_feat_list:
             visual = self.image_encoder
@@ -1149,20 +1083,13 @@ class CustomCLIP(nn.Module):
             patch_tokens = image_features.unsqueeze(1)
         patch_tokens = F.normalize(patch_tokens, dim=-1)
 
-        if dom_label is None:
-            dom_idx_tensor = torch.zeros(batch_size, dtype=torch.long, device=device)
-        else:
-            dom_idx_tensor = dom_label.long().to(device)
-
         semantic_logits_list = []
         for i in range(batch_size):
-            dom_idx = int(dom_idx_tensor[i].item()) % domain_count
-            domain_name = self.domainnames[dom_idx].replace("_", " ")
             tokenized_prompts = torch.cat(
-                [clip.tokenize(f"A {domain_name} of a {p}") for p in self.classnames[:-1]]
+                [clip.tokenize(p.replace("_", " ")) for p in self.classnames[:-1]]
             ).to(device)
             tokenized_unknown_prompt = clip.tokenize(
-                f"A {domain_name} of a {self.classnames[-1]}"
+                self.classnames[-1].replace("_", " ")
             ).to(device)
 
             sample_patch_tokens = patch_tokens[i : i + 1]
@@ -1259,19 +1186,23 @@ class CustomCLIP(nn.Module):
             domain_patch_tokens = known_patch_tokens[domain_mask]
         
             domain_name = self.domainnames[domain].replace('_', ' ')
-            tokenized_prompts = torch.cat([
+            tokenized_domain_prompts = torch.cat([
                 clip.tokenize(f"A {domain_name} of a {p}")
                 for p in self.classnames[:-1]
             ]).to(device)
+            tokenized_prompts = torch.cat([
+                clip.tokenize(p.replace("_", " "))
+                for p in self.classnames[:-1]
+            ]).to(device)
             tokenized_unknown_prompt = clip.tokenize(
-                f"A {domain_name} of a {self.classnames[-1]}"
+                self.classnames[-1].replace("_", " ")
             ).to(device)
         
             n_cls = len(self.classnames)
             domain_img = einops.repeat(domain_features, 'm n -> k m n', k=n_cls-1)
             cross_atten = self.cross_attention(domain_img, self.projector(attri), mask_embed)
             domain_logits, domain_prompt_embeddings = self._process_domain_features(
-                domain_features, cross_atten, domain_img, tokenized_prompts,
+                domain_features, cross_atten, domain_img, tokenized_domain_prompts,
                 logit_scale
             )
             semantic_prompt_embeddings = self._build_class_semantic_prompt_embeddings(

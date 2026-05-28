@@ -421,18 +421,16 @@ for param in train_model.parameters():
 for p in train_model.cross_attention.parameters():
     p.requires_grad= True
 train_model.projector.requires_grad = True
-for p in train_model.promptlearner.parameters():
-    p.requires_grad = True
 for p in train_model.class_semantic_builder.parameters():
     p.requires_grad = True
+train_model.unknown_prompt_ctx.requires_grad = True
 
 
 params = [
-            {"params": train_model.promptlearner.parameters(),'lr' : config["prompt_lr"]},
             {"params": train_model.projector.parameters(),'lr' : config["projector_lr"]},
             {"params": train_model.cross_attention.parameters(),'lr' : config["cross_attention_lr"]},
             {"params": train_model.class_semantic_builder.parameters(), 'lr': config["prompt_lr"]},
-            {"params": dynamic_unknown_generator.semantic_prompt_builder.parameters(), 'lr': config["prompt_lr"]},
+            {"params": [train_model.unknown_prompt_ctx], 'lr': config["prompt_lr"]},
         ]
 optimizer = torch.optim.AdamW(params,  weight_decay=config["weight_decay"])
 # optimizer = torch.optim.SGD(params,momentum=0.9)
