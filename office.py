@@ -259,6 +259,7 @@ domain_prev = domain_prev.to(device)
 
 class_names.sort()
 train_prev_classnames = class_names[:54]
+class_to_attri_idx = {name: idx for idx, name in enumerate(train_prev_classnames)}
 
 class AvgMeter:
     def __init__(self, name="Metric"):
@@ -318,50 +319,39 @@ W_REP = 0.5
 W_COH = 0.2
 
 
-def train_epoch(model,params, unknown_image_generator, domainnames, train_loader, optimizer, lr_scheduler, step,epoch):
+def train_epoch(model,params, dynamic_unknown_generator, domainnames, train_loader, optimizer, lr_scheduler, step,epoch):
     loss_meter = AvgMeter()
     accuracy_meter = AvgMeter()
-    warmup_period = 2000
-    # tqdm_object = tqdm(train_loader, total=len(train_loader))
-    batch  =1
-    for img_prev, domain_prev, label_prev, label_one_hot_prev in train_loader:
+    tqdm_object = tqdm(train_loader, total=len(train_loader))
+    dynamic_unknown_generator.reset_epoch_stats()
+
+    for img_prev, domain_prev, label_prev, label_one_hot_prev in tqdm_object:
         img_prev = img_prev.to(device)
         domain_prev = domain_prev.to(device)
 
-        random_prompts = random.sample(prompt_list, 3)
-        random_int = random.randint(0, 2)
+        random_int = epoch %3
         label_prev = label_prev.to(device)
         label_one_hot_prev = label_one_hot_prev.to(device)
-        
-
-        unknown_posprompt1 = domains_open[0].replace("_", " ") + " of an " + random_prompts[0]
-        generated_unknown_images1 = unknown_image_generator(batch, unknown_posprompt1, known_classes)
-
-        unknown_posprompt2 = domains_open[1].replace("_", " ") + " of an " + random_prompts[1]
-        generated_unknown_images2 = unknown_image_generator(batch, unknown_posprompt2, known_classes)
-
-        unknown_posprompt3 = domains_open[2].replace("_", " ") + " of an " + random_prompts[2]
-        generated_unknown_images3 = unknown_image_generator(batch, unknown_posprompt3, known_classes)
-    
-
+        generated_unknown_images1, generation_modes, guide = dynamic_unknown_generator.generate(
+            model=model,
+            known_images=img_prev,
+            known_labels=label_prev,
+            domain_name=domainnames[random_int],
+            attri_embed=attri_embed,
+            mask_embed=mask_embed,
+        )
 
         unknown_label_rank = len(train_prev_classnames)
-        unknown_label = torch.full((3*generated_unknown_images1.shape[0],), unknown_label_rank).to(device)
+        unknown_label = torch.full((generated_unknown_images1.shape[0],), unknown_label_rank).to(device)
         
-        unknown_domain1 = torch.full((generated_unknown_images1.shape[0],), 0).to(device)
-        unknown_domain2 = torch.full((generated_unknown_images2.shape[0],), 1).to(device)
-        unknown_domain3 = torch.full((generated_unknown_images3.shape[0],), 2).to(device)
-
-
-        generated_unknown_images = torch.cat((generated_unknown_images1, generated_unknown_images2,generated_unknown_images3), dim=0)
-        unknown_domains = torch.cat((unknown_domain1, unknown_domain2, unknown_domain3), dim=0)
-        # generated_unknown_images = generated_unknown_images1
-        # unknown_domains = unknown_domain1
+        unknown_domain1 = torch.full((generated_unknown_images1.shape[0],), random_int).to(device)
+        generated_unknown_images = generated_unknown_images1
+        unknown_domains = unknown_domain1
         random_indices = image_filter(generated_unknown_images) 
         selected_images = generated_unknown_images[random_indices]
         selected_labels = unknown_label[random_indices]
         selected_domains = unknown_domains[random_indices]
-        # print(len(random_indices))
+        selected_modes = [generation_modes[i] if i < len(generation_modes) else "fallback" for i in random_indices]
         
         img = torch.cat((img_prev, selected_images), dim=0)
         img = img.to(device)
@@ -371,7 +361,6 @@ def train_epoch(model,params, unknown_image_generator, domainnames, train_loader
 
         domain = torch.cat((domain_prev, selected_domains), dim=0)
         domain = domain.to(device)
-        # with profile(with_flops=True) as prof:
 
         (
             output,
@@ -394,12 +383,11 @@ def train_epoch(model,params, unknown_image_generator, domainnames, train_loader
             + W_REP * rep_loss
             + W_COH * coh_loss
         )
-    
+
         loss = crossentropy_loss 
 
         optimizer.zero_grad()
         loss.backward()
-        # print(model.promptlearner.projector[0].linear.weight.grad)
         utils.clip_grad_norm_(params, max_norm=1.0)
         optimizer.step()
         count = img.size(0)
@@ -407,9 +395,36 @@ def train_epoch(model,params, unknown_image_generator, domainnames, train_loader
 
         acc = compute_accuracy(output, label)[0].item()
         accuracy_meter.update(acc, count)
+
+        dynamic_unknown_generator.update_distance_stats(
+            model=model,
+            selected_images=selected_images,
+            selected_modes=selected_modes,
+            guide=guide,
+        )
+
+    dynamic_unknown_generator.log_epoch_stats(epoch)
+
     return loss_meter, accuracy_meter.avg
 
-unknown_image_generator = GenerateUnknownImages().to(device)
+unknown_image_generator = GenerateUnknownImages(
+    semantic_heads=attri_embed.shape[1],
+    semantic_alpha=0.3,
+).to(device)
+dynamic_unknown_generator = DynamicPseudoUnknownGenerator(
+    unknown_image_generator=unknown_image_generator,
+    prompt_pool=prompt_list,
+    known_class_names=train_prev_classnames,
+    known_classes_text=known_classes,
+    dynamic_batch_size=3,
+    near_far_ratio=(2, 1),
+    enable_dynamic=True,
+    attri_embed=attri_embed,
+    mask_embed=mask_embed,
+    class_to_attri_idx=class_to_attri_idx,
+    num_semantic_heads=attri_embed.shape[1],
+    offline_attri_alpha=0.2,
+)
 
 train_classnames = train_prev_classnames + ['unknown']
 print(f'length of train_classnames : {len(train_classnames)}')
@@ -421,12 +436,14 @@ for param in train_model.parameters():
 for p in train_model.cross_attention.parameters():
     p.requires_grad= True
 train_model.projector.requires_grad = True
-for p in train_model.promptlearner.parameters():
+for p in train_model.class_semantic_builder.parameters():
     p.requires_grad = True
+train_model.unknown_prompt_ctx.requires_grad = True
 params = [
-            {"params": train_model.promptlearner.parameters(),'lr' : config["prompt_lr"]},
             {"params": train_model.projector.parameters(),'lr' : config["projector_lr"]},
             {"params": train_model.cross_attention.parameters(),'lr' : config["cross_attention_lr"]},
+            {"params": train_model.class_semantic_builder.parameters(), 'lr': config["prompt_lr"]},
+            {"params": [train_model.unknown_prompt_ctx], 'lr': config["prompt_lr"]},
         ]
 optimizer = torch.optim.AdamW(params,  weight_decay=config["weight_decay"])
 
@@ -509,7 +526,17 @@ for epoch in range(num_epochs):
     open_set_features = []
     print(f"Epoch: {epoch + 1}")
     train_model.train()
-    train_loss, train_acc = train_epoch(train_model,all_params, unknown_image_generator, domain_names, train_dl, optimizer, lr_scheduler, step,epoch)
+    train_loss, train_acc = train_epoch(
+        train_model,
+        all_params,
+        dynamic_unknown_generator,
+        domain_names,
+        train_dl,
+        optimizer,
+        lr_scheduler,
+        step,
+        epoch,
+    )
     print(f"epoch {epoch+1} : training accuracy: {train_acc}")
 
     save_path = f"{output_dir}/{domains[-1]}/{target}_{shots}_temp.pth"
@@ -536,7 +563,13 @@ for epoch in range(num_epochs):
             test_label_one_hot = test_label_one_hot.to(device)
             
             # with profile(with_flops=True) as prof:
-            test_output,_ = test_model(test_img.to(device),attri_embed,mask_embed,test_label)
+            test_output,_ = test_model(
+                test_img.to(device),
+                attri_embed,
+                mask_embed,
+                test_label,
+                test_domain,
+            )
 
             predictions = torch.argmax(test_output, dim=1)
             class_a_mask = (test_label <= 53) 
