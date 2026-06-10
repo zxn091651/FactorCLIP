@@ -105,9 +105,9 @@ parser.add_argument('--target_domain', type=str, required=True,
 parser.add_argument('--shots', type=int, default=1, 
                     help='Number of shots per class')
 parser.add_argument('--config', type=str, 
-                    help='Path to config file', default='configs/pacs.yaml')
-parser.add_argument('--data_root', type=str, default='/users/student/Datasets/domainbed/pacs',
-                    help='Root directory for PACS data')
+                    help='Path to config file', default='configs/office_final.yaml')
+parser.add_argument('--data_root', type=str, default='./datasets/OfficeHome',
+                    help='Root directory for Office-Home data')
 parser.add_argument('--output_dir', type=str, default='./experiments',
                     help='Output directory for results')
 parser.add_argument('--degrees', type=int, default=0,
@@ -122,12 +122,16 @@ import yaml
 with open(args.config, 'r') as f:
     config = yaml.safe_load(f)
 
+args_dict = vars(args)
+for key, value in args_dict.items():
+    config[key] = value
+
 # Split the source domains string into a list
 source_domains = args.source_domains.split(',')
-target_domains = args.target_domain
+target_domain = args.target_domain
 
 # Set the domains list
-domains = source_domains + [target_domains]
+domains = source_domains + [target_domain]
 target = domains[-1]
 shots =args.shots
 
@@ -141,8 +145,8 @@ image_path_dom1=[]
 label_class_dom1=[]
 label_dom1=[]
 class_names1=[]
-path_dom1= data_root+'/'+domains[0]+'/train'
-domain_name1 = path_dom1.split('/')[-2]
+path_dom1= data_root+'/'+domains[0]
+domain_name1 = path_dom1.split('/')[-1]
 dirs_dom1=os.listdir(path_dom1)
 class_names = dirs_dom1
 num_classes = len(class_names)
@@ -170,8 +174,8 @@ image_path_dom2=[]
 label_class_dom2=[]
 label_dom2=[]
 class_names2=[]
-path_dom2=data_root+'/'+domains[1]+'/train'
-domain_name2 = path_dom2.split('/')[-2]
+path_dom2=data_root+'/'+domains[1]
+domain_name2 = path_dom2.split('/')[-1]
 dirs_dom2=os.listdir(path_dom2)
 dirs_dom2.sort()
 c=0
@@ -196,8 +200,8 @@ image_path_dom3=[]
 label_class_dom3=[]
 label_dom3=[]
 class_names3=[]
-path_dom3=data_root+'/'+domains[2]+'/train'
-domain_name3 = path_dom3.split('/')[-2]
+path_dom3=data_root+'/'+domains[2]
+domain_name3 = path_dom3.split('/')[-1]
 dirs_dom3=os.listdir(path_dom3)
 dirs_dom3.sort()
 c=0
@@ -446,8 +450,8 @@ test_image_path_dom=[]
 test_label_class_dom=[]
 test_label_dom=[]
 test_domain_names=[]
-test_path_dom=data_root+'/'+domains[3]+'/val'
-test_domain_name = test_path_dom.split('/')[-2]
+test_path_dom=data_root+'/'+domains[3]
+test_domain_name = test_path_dom.split('/')[-1]
 test_dirs_dom=os.listdir(test_path_dom)
 test_class_names = test_dirs_dom
 test_num_classes = len(test_class_names)
