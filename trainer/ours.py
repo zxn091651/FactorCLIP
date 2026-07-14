@@ -3,6 +3,7 @@ import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 from collections import OrderedDict
 from typing import List, Dict, Optional, Tuple, Union
 import random
@@ -329,8 +330,11 @@ class StableDiffusion(nn.Module):
             safety_checker=None,
             requires_safety_checker=False,
             # local_files_only = True
-            
-        ).to(device)
+        )
+        if torch.cuda.is_available():
+            self.pipe.enable_model_cpu_offload()
+        else:
+            self.pipe.to(device)
         
         # self.pipe.scheduler = DPMSolverMultistepScheduler.from_config(
         #     self.pipe.scheduler.config,
@@ -383,7 +387,7 @@ class StableDiffusion(nn.Module):
             truncation=True,
             return_tensors="pt",
         )
-        input_ids = text_inputs.input_ids.to(device)
+        input_ids = text_inputs.input_ids.to(self.pipe._execution_device)
         with torch.no_grad():
             prompt_embeds = self.pipe.text_encoder(input_ids)[0]
         if self.semantic_noise_std > 0:
@@ -1182,19 +1186,34 @@ class CustomCLIP(nn.Module):
         token_start = 1
         token_end = token_start + self.ctx
         batch_size = ctx_tokens.size(0)
+        prompt_chunk_size = 4
         for i in range(batch_size):
-            embedding_copy = base_embedding.clone()
             if ctx_tokens.dim() == 3:
                 ctx_i = ctx_tokens[i].unsqueeze(0)
             elif ctx_tokens.dim() == 4:
                 ctx_i = ctx_tokens[i]
             else:
                 raise ValueError("ctx_tokens must be [B, ctx, D] or [B, C, ctx, D]")
-            embedding_copy[:, token_start:token_end, :] += ctx_i.to(
-                device=embedding_copy.device, dtype=embedding_copy.dtype
-            )
-            embedding_int = self.text_encoder(embedding_copy, tokenized_prompts)
-            prompt_embeddings.append(F.normalize(embedding_int, dim=-1))
+            encoded_chunks = []
+            for start in range(0, base_embedding.size(0), prompt_chunk_size):
+                end = min(start + prompt_chunk_size, base_embedding.size(0))
+                embedding_copy = base_embedding[start:end].clone()
+                ctx_chunk = ctx_i if ctx_i.size(0) == 1 else ctx_i[start:end]
+                embedding_copy[:, token_start:token_end, :] += ctx_chunk.to(
+                    device=embedding_copy.device, dtype=embedding_copy.dtype
+                )
+                tokenized_chunk = tokenized_prompts[start:end]
+                if self.training and torch.is_grad_enabled() and embedding_copy.requires_grad:
+                    embedding_int = checkpoint(
+                        lambda embeddings, tokens: self.text_encoder(embeddings, tokens),
+                        embedding_copy,
+                        tokenized_chunk,
+                        use_reentrant=False,
+                    )
+                else:
+                    embedding_int = self.text_encoder(embedding_copy, tokenized_chunk)
+                encoded_chunks.append(F.normalize(embedding_int, dim=-1))
+            prompt_embeddings.append(torch.cat(encoded_chunks, dim=0))
         return torch.stack(prompt_embeddings, dim=0)
 
     def _build_unknown_semantic_prompt_embeddings(
@@ -1304,17 +1323,27 @@ class CustomCLIP(nn.Module):
         class_agnostic_ctx = cross_atten.mean(dim=0)  # [num_samples, dim]
         token_start = 1
         token_end = token_start + self.ctx
+        prompt_chunk_size = 4
 
         for i in range(domain_features.size(0)):
-            embedding_copy = embedding.clone()
-
-            # A''(x_i): same context added to all known-class prompts.
             ctx_i = class_agnostic_ctx[i].view(1, 1, -1)
-            embedding_copy[:, token_start:token_end, :] += ctx_i
-            
-            # Compute embeddings and logits
-            embedding_int = self.text_encoder(embedding_copy, tokenized_prompts)
-            embedding_int = F.normalize(embedding_int, dim=-1)
+            encoded_chunks = []
+            for start in range(0, embedding.size(0), prompt_chunk_size):
+                end = min(start + prompt_chunk_size, embedding.size(0))
+                embedding_copy = embedding[start:end].clone()
+                embedding_copy[:, token_start:token_end, :] += ctx_i
+                tokenized_chunk = tokenized_prompts[start:end]
+                if self.training and torch.is_grad_enabled() and embedding_copy.requires_grad:
+                    embedding_chunk = checkpoint(
+                        lambda embeddings, tokens: self.text_encoder(embeddings, tokens),
+                        embedding_copy,
+                        tokenized_chunk,
+                        use_reentrant=False,
+                    )
+                else:
+                    embedding_chunk = self.text_encoder(embedding_copy, tokenized_chunk)
+                encoded_chunks.append(F.normalize(embedding_chunk, dim=-1))
+            embedding_int = torch.cat(encoded_chunks, dim=0)
             logit = logit_scale * domain_features[i] @ embedding_int.t()
             
             domain_logits.append(logit)

@@ -2,6 +2,7 @@ import os
 import glob
 import random
 import argparse
+import warnings
 import yaml
 from pathlib import Path
 from collections import defaultdict
@@ -37,7 +38,11 @@ def seed_everything(seed: int):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
-torch.use_deterministic_algorithms(True)
+warnings.filterwarnings("default", category=UserWarning, message=".*deterministic.*")
+if torch.cuda.is_available():
+    torch.backends.cuda.enable_mem_efficient_sdp(False)
+    torch.backends.cuda.enable_math_sdp(True)
+torch.use_deterministic_algorithms(True, warn_only=True)
 seed_everything(42)
 device = "cuda" if torch.cuda.is_available() else "cpu"
 clip_model, preprocess = clip.load("ViT-B/32", device='cpu')
@@ -51,7 +56,7 @@ parser.add_argument('--shots', type=int, default=1,
                     help='Number of shots per class')
 parser.add_argument('--config', type=str, 
                     help='Path to config file', default='configs/pacs.yaml')
-parser.add_argument('--data_root', type=str, default='/users/student/Datasets/domainbed/pacs',
+parser.add_argument('--data_root', type=str, default='./datasets/PACS',
                     help='Root directory for PACS data')
 parser.add_argument('--output_dir', type=str, default='./experiments',
                     help='Output directory for results')
@@ -59,6 +64,12 @@ parser.add_argument('--degrees', type=int, default=5,
                     help='Degrees of rotation')     
 parser.add_argument('--project_dim', type=int, default=128,
                     help='Projection dimension for the model')
+parser.add_argument('--epochs', type=int, default=10,
+                    help='Number of training epochs')
+parser.add_argument('--max_train_batches', type=int, default=0,
+                    help='Limit training batches per epoch; 0 means no limit')
+parser.add_argument('--max_test_batches', type=int, default=0,
+                    help='Limit test batches per epoch; 0 means no limit')
 args = parser.parse_args()
 attri_embed = torch.from_numpy(np.load('./attributes/attribute_pacs.npy')).to(device).to(torch.float32)
 mask_embed = torch.from_numpy(np.load('./attributes/masks_pacs.npy')).to(device).to(torch.bool)
@@ -303,7 +314,9 @@ def train_epoch(model,params, dynamic_unknown_generator, domainnames, train_load
     tqdm_object = tqdm(train_loader, total=len(train_loader))
     dynamic_unknown_generator.reset_epoch_stats()
 
-    for img_prev, domain_prev, label_prev, label_one_hot_prev in tqdm_object:
+    for batch_idx, (img_prev, domain_prev, label_prev, label_one_hot_prev) in enumerate(tqdm_object):
+        if args.max_train_batches and batch_idx >= args.max_train_batches:
+            break
         img_prev = img_prev.to(device)
         domain_prev = domain_prev.to(device)
 
@@ -486,7 +499,7 @@ test_img, test_domain, test_label, test_label_one_hot = next(iter(test_dl))
 
 step = "epoch"
 best_acc = 0
-num_epochs = 10
+num_epochs = args.epochs
 best_closed_set_acc = 0
 best_open_set_acc = 0
 best_avg_acc = 0
@@ -536,7 +549,9 @@ for epoch in range(num_epochs):
         total_correct_b = 0
         total_samples_b = 0
 
-        for test_img, test_domain, test_label, test_label_one_hot in test_tqdm_object:
+        for batch_idx, (test_img, test_domain, test_label, test_label_one_hot) in enumerate(test_tqdm_object):
+            if args.max_test_batches and batch_idx >= args.max_test_batches:
+                break
             test_img = test_img.to(device)
             test_domain =test_domain.to(device)
             test_label = test_label.to(device)
@@ -569,7 +584,11 @@ for epoch in range(num_epochs):
         open_set_accuracy = total_correct_b / total_samples_b if total_samples_b > 0 else 0.0
         open_set_acc = open_set_accuracy*100
 
-        average_acc = (2*closed_set_acc*open_set_acc)/(closed_set_acc + open_set_acc)
+        average_acc = (
+            (2 * closed_set_acc * open_set_acc) / (closed_set_acc + open_set_acc)
+            if (closed_set_acc + open_set_acc) > 0
+            else 0.0
+        )
 
         print(f"Closed Set Accuracy: {closed_set_acc:.2f}%")
         print(f"Open Set Accuracy: {open_set_acc:.2f}%")

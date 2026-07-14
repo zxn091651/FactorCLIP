@@ -2,6 +2,7 @@ import os
 import glob
 import random
 import argparse
+import warnings
 import yaml
 from pathlib import Path
 from collections import defaultdict
@@ -36,6 +37,11 @@ def seed_everything(seed: int):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 seed_everything(42)
+warnings.filterwarnings("default", category=UserWarning, message=".*deterministic.*")
+if torch.cuda.is_available():
+    torch.backends.cuda.enable_mem_efficient_sdp(False)
+    torch.backends.cuda.enable_math_sdp(True)
+torch.use_deterministic_algorithms(True, warn_only=True)
 
 class AvgMeter:
     """Computes and stores the average and current value."""
@@ -113,7 +119,7 @@ class DataTrain(Dataset):
     return image, domain, label, label_one_hot 
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
-clip_model, preprocess = clip.load("../weights/ViT-B-32.pt", device='cpu')
+clip_model, preprocess = clip.load("ViT-B/32", device='cpu')
 preprocess_train, preprocess_val = preprocess
 with open('prompts/prompts_list_multi.txt', 'r') as file:
     prompt_list = file.readlines()
@@ -131,250 +137,157 @@ repeat_transform = transforms.Compose([
 ])
 
 
-parser = argparse.ArgumentParser(description='PACS Domain Adaptation Training')
-parser.add_argument('--source_domains', type=str, required=True, 
+parser = argparse.ArgumentParser(description='Multi-dataset Domain Adaptation Training')
+parser.add_argument('--source_domains', type=str, required=True,
                     help='Comma-separated source domains')
-parser.add_argument('--target_domain', type=str, required=True, 
+parser.add_argument('--target_domain', type=str, required=True,
                     help='Target domain')
-parser.add_argument('--shots', type=int, default=1, 
+parser.add_argument('--shots', type=int, default=1,
                     help='Number of shots per class')
-parser.add_argument('--config', type=str, 
-                    help='Path to config file', default='configs/pacs.yaml')
-parser.add_argument('--data_root', type=str, default='/home/vis-comp/mohamad.hassan/datasets/domainbed/pacs',
-                    help='Root directory for PACS data')
+parser.add_argument('--config', type=str,
+                    help='Path to config file', default='configs/multi.yaml')
+parser.add_argument('--data_root', type=str, default='./datasets',
+                    help='Root containing office31, visda2017, stl10, and domainnet')
 parser.add_argument('--output_dir', type=str, default='./experiments',
                     help='Output directory for results')
 parser.add_argument('--degrees', type=int, default=5,
                     help='Degrees of rotation')
 parser.add_argument('--project_dim', type=int, default=128,
                     help='Projection dimension for the model')
+parser.add_argument('--epochs', type=int, default=10,
+                    help='Number of training epochs')
+parser.add_argument('--max_train_batches', type=int, default=0,
+                    help='Limit training batches per epoch; 0 means no limit')
+parser.add_argument('--max_test_batches', type=int, default=0,
+                    help='Limit test batches per epoch; 0 means no limit')
 args = parser.parse_args()
 
-import yaml
-
-# Load the configuration from the YAML file
 with open(args.config, 'r') as f:
     config = yaml.safe_load(f)
 
-args_dict = vars(args)
-for key, value in args_dict.items():
+for key, value in vars(args).items():
     config[key] = value
 
-# Split the source domains string into a list
 source_domains = args.source_domains.split(',')
-target_domains = args.target_domain
-
-# Set the domains list
-domains = source_domains + [target_domains]
+target_domain = args.target_domain
+domains = source_domains + [target_domain]
 target = domains[-1]
-shots =args.shots
-clip_model, preprocess = clip.load("../weights/ViT-B-32.pt", device='cpu',degrees=args.degrees)
+shots = args.shots
+clip_model, preprocess = clip.load("ViT-B/32", device='cpu', degrees=args.degrees)
 preprocess_train, preprocess_val = preprocess
 
-data_root = args.data_root
+multi_root = Path(args.data_root)
 output_dir = args.output_dir
 
-
-'''
-############### The source dataset 1 ##################
-'''
-
-image_path_dom1=[]
-label_class_dom1=[]
-label_dom1=[]
-class_names1=[]
-paths_list={}
-class_names4={}
-all_classes={}
-root1 = '/home/vis-comp/mohamad.hassan/datasets/domainbed/amazon/images'
-paths_labels =[]
-with open('/home/vis-comp/mohamad.hassan/datasets/domainbed/amazon_split.txt', 'r') as file:
-    for line in file:
-        parts = line.strip().split('/')
-        paths = line.strip().split()[0]
-        # print(paths)
-        if len(parts) >= 2:
-            filename,label = parts[-1].split()
-            class_name = parts[-2]
-            if class_name not in class_names1 and (int)(label)<48:
-                class_names1.append(class_name)
-                class_names4[(int)(label)]=class_name         
-            filename_with_class_name = f"{class_name}/{filename}"
-            paths_list.setdefault(class_name, [])
-            # print(os.path.join(root1,paths))
-            paths_list[class_name].append((os.path.join(root1,paths),(int)(label)))
-for i in class_names1:
-    lists_sample = random.sample(paths_list[i],shots)
-    paths_labels.extend(lists_sample)
-random.shuffle(paths_labels)
-for p,l in paths_labels:
-    label_class_dom1.append((int)(l))
-    image_path_dom1.append(p)
-label_dom1.extend([0 for p in image_path_dom1])
-
-# print(len(class_names1))
-print(class_names4.keys())
-
-
-'''
-############### The source dataset 2 ##################
-'''
-paths_list={}
-image_path_dom2=[]
-label_class_dom2=[]
-label_dom2=[]
-class_names2=[]
-root2 = '/home/vis-comp/mohamad.hassan/datasets/domainbed/visda/train'
-paths_labels =[]
-with open('/home/vis-comp/mohamad.hassan/datasets/domainbed/visda/visda_split.txt', 'r') as file:
-    for line in file:
-        # print(line)
-        parts = line.strip().split('/')
-        # print(parts)
-        paths = line.strip().split()[0]
-        if len(parts) >= 2:
-            filename,label = parts[-1].split()
-            # print(label)
-            class_name = parts[-2]
-            if class_name not in class_names2 and (int)(label)<48 and (int)(label) not in class_names4.keys():
-                class_names2.append(class_name)    
-                class_names4[(int)(label)]=class_name       
-            filename_with_class_name = f"{class_name}/{filename}"
-            paths_list.setdefault(class_name, [])
-            paths_list[class_name].append((os.path.join(root2,paths),(int)(label)))
-for i in class_names2:
-    lists_sample = random.sample(paths_list[i],shots)
-    paths_labels.extend(lists_sample)
-random.shuffle(paths_labels)
-for p,l in paths_labels:
-    label_class_dom2.append((int)(l))
-    image_path_dom2.append(p)
-label_dom2.extend([1 for p in image_path_dom2])
-print(class_names4.keys())
-
-
-'''
-############### The source dataset 3 ##################
-'''
-
-paths_list={}
-image_path_dom3=[]
-label_class_dom3=[]
-label_dom3=[]
-class_names3=[]
-root3 = '/home/vis-comp/mohamad.hassan/datasets/domainbed/stl10/train'
-paths_labels =[]
-with open('/home/vis-comp/mohamad.hassan/datasets/domainbed/stl10/stl10_split.txt', 'r') as file:
-    for line in file:
-        parts = line.strip().split('/')
-        paths = line.strip().split()[0]
-        if len(parts) >= 2:
-            filename,label = parts[-1].split()
-            class_name = parts[-2]
-            if class_name not in class_names3 and (int)(label)<48:
-                class_names3.append(class_name)           
-                class_names4[(int)(label)]=class_name
-            filename_with_class_name = f"{class_name}/{filename}"
-            paths_list.setdefault(class_name, [])
-            paths_list[class_name].append((os.path.join(root3,paths),(int)(label)))
-for i in class_names3:
-    lists_sample = random.sample(paths_list[i],shots)
-    paths_labels.extend(lists_sample)
-random.shuffle(paths_labels)
-for p,l in paths_labels:
-    label_class_dom3.append((int)(l))
-    image_path_dom3.append(p)
-label_dom3.extend([2 for p in image_path_dom3])
-print(class_names4.keys())
-
-'''
-############### The combining the source dataset ##################
-'''   
-  
-image_path_final=[]
-image_path_final.extend(image_path_dom1)
-image_path_final.extend(image_path_dom2)
-image_path_final.extend(image_path_dom3)
-label_class_final=[]
-label_class_final.extend(label_class_dom1)
-label_class_final.extend(label_class_dom2)
-label_class_final.extend(label_class_dom3)
-label_dom_final=[]
-label_dom_final.extend(label_dom1)
-label_dom_final.extend(label_dom2)
-label_dom_final.extend(label_dom3)
-domain_names=['amazon','synthetic 2D renderings', 'photo']
-print("domain_names",domain_names)
-
-'''
-############### Test dataset ##################
-'''
-
-test_image_path_dom=[]
-test_label_class_dom=[]
-test_label_dom=[]
-test_classnames=[]
-# all_classes=[]
-test_path_dom='./data/domainnet/'+target_domains[0]
-test_domain_name = test_path_dom.split('/')[-1]
-c=0
-index=0
 target_labels = [0, 1, 5, 6, 10, 11, 14, 17, 20, 26] + list(range(31, 37)) + list(range(39, 44)) + list(range(45, 47)) + list(range(48, 68))
 known_index_dom = [0, 1, 5, 6, 10, 11, 14, 17, 20, 26] + list(range(31, 37)) + list(range(39, 44)) + list(range(45, 47))
-root4 = f'/home/vis-comp/mohamad.hassan/datasets/domainbed/domainnet'
-with open(f'/home/vis-comp/mohamad.hassan/datasets/domainbed/{target_domains}_test_new.txt', 'r') as file:
-    paths_labels =[]
-    for line in file:
-        parts = line.strip().split('/')
-        paths = line.strip().split()[0]
-        if len(parts) >= 3:
-            filename,label = parts[-1].split()
-            class_name = parts[-2]
-            if (int)(label) not in class_names4.keys() and (int)(label)<48:
-                class_names4[(int)(label)]=class_name    
-            if (int)(label) not in all_classes.keys() and (int)(label)>=48 :
-                all_classes[(int)(label)]=class_name       
-            filename_with_class_name = f"{class_name}/{filename}"
-            # dom1_filenames.append(filename_with_class_name)
-            # label_class_dom1.append((int)(label))
-            # image_path_dom1.append(os.path.join(root1,paths))
-            paths_labels.append((os.path.join(root4,paths),(int)(label)))
-    random.shuffle(paths_labels)
-    for p,l in paths_labels:
-        test_label_class_dom.append((int)(l))
-        test_image_path_dom.append(p) 
-    test_label_dom.extend([3 for p in test_image_path_dom])
+IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".bmp")
 
-test_image_path_final=[]
-test_image_path_final.extend(test_image_path_dom)
-# test_classnames.extend(class_names4)
 
-test_label_class_final=[]
-test_label_class_final_modified = [label if label <= 47 else 48 for label in test_label_class_dom]
-test_label_class_final.extend(test_label_class_final_modified)
-# print("test_label_class_final",test_label_class_final)
+def image_paths(class_dir):
+    paths = []
+    for extension in IMAGE_EXTS:
+        paths.extend(glob.glob(str(class_dir / f"**/*{extension}"), recursive=True))
+        paths.extend(glob.glob(str(class_dir / f"**/*{extension.upper()}"), recursive=True))
+    paths = sorted(set(paths))
+    random.shuffle(paths)
+    return paths
 
-test_label_dom_final=[]
-test_label_dom_final.extend(test_label_dom)
 
-test_domain_names = []
-test_domain_names.append(test_domain_name)
-test_domain_names.append(test_domain_name)
-test_domain_names.append(test_domain_name) 
+def sample_items(items, count):
+    return random.sample(items, min(count, len(items)))
 
-# Known Classes
-# known_class_names = test_classnames.sort()
-known_class_names=[]
-for i in range(48):
-    known_class_names.append(class_names4[i])
+
+def source_class_dirs(source_root):
+    return sorted([path for path in source_root.iterdir() if path.is_dir()], key=lambda path: path.name)
+
+
+def add_source_domain(source_root, domain_id, start_label, class_names):
+    domain_images = []
+    domain_classes = []
+    domain_labels = []
+    next_label = start_label
+
+    for class_dir in source_class_dirs(source_root):
+        if next_label >= 48:
+            break
+        paths = image_paths(class_dir)
+        if not paths:
+            continue
+        class_names[next_label] = class_dir.name
+        for image_path in sample_items(paths, shots):
+            domain_images.append(image_path)
+            domain_classes.append(next_label)
+            domain_labels.append(domain_id)
+        next_label += 1
+
+    return domain_images, domain_classes, domain_labels, next_label
+
+
+office_amazon = multi_root / "office31" / "amazon"
+visda_root = multi_root / "visda2017"
+stl_root = multi_root / "stl10"
+domainnet_root = multi_root / "domainnet"
+test_domain_root = domainnet_root / target_domain
+
+required_paths = [office_amazon, visda_root, stl_root, test_domain_root]
+missing_paths = [str(path) for path in required_paths if not path.exists()]
+if missing_paths:
+    raise FileNotFoundError(
+        "Missing multi-dataset directories under "
+        f"{multi_root}: {', '.join(missing_paths)}"
+    )
+
+class_names4 = {}
+all_classes = {}
+next_label = 0
+image_path_dom1, label_class_dom1, label_dom1, next_label = add_source_domain(
+    office_amazon, 0, next_label, class_names4
+)
+image_path_dom2, label_class_dom2, label_dom2, next_label = add_source_domain(
+    visda_root, 1, next_label, class_names4
+)
+image_path_dom3, label_class_dom3, label_dom3, next_label = add_source_domain(
+    stl_root, 2, next_label, class_names4
+)
+
+if next_label < 48:
+    raise RuntimeError(f"Multi-dataset sources produced {next_label} known classes; expected 48")
+
+image_path_final = image_path_dom1 + image_path_dom2 + image_path_dom3
+label_class_final = label_class_dom1 + label_class_dom2 + label_class_dom3
+label_dom_final = label_dom1 + label_dom2 + label_dom3
+domain_names = ["amazon", "synthetic 2D renderings", "photo"]
+print("domain_names", domain_names)
+
+test_dirs_dom = source_class_dirs(test_domain_root)
+if len(test_dirs_dom) <= max(target_labels):
+    raise RuntimeError(
+        f"{test_domain_root} has {len(test_dirs_dom)} classes, "
+        f"expected at least {max(target_labels) + 1}"
+    )
+
+test_image_path_final = []
+test_label_class_final = []
+for index in target_labels:
+    class_dir = test_dirs_dom[index]
+    if index in known_index_dom and index < 48:
+        class_names4[index] = class_dir.name
+    if index >= 48:
+        all_classes[index] = class_dir.name
+    for image_path in image_paths(class_dir):
+        test_image_path_final.append(image_path)
+        test_label_class_final.append(index if index <= 47 else 48)
+
+test_label_dom_final = [3 for _ in test_image_path_final]
+test_domain_names = [target_domain, target_domain, target_domain]
+
+known_class_names = [class_names4[index] for index in range(48)]
 known_classes = ",".join(known_class_names)
-unknown_class_names=[]
-for i in range(48,68):
-    unknown_class_names.append(all_classes[i])
+unknown_class_names = [all_classes[index] for index in range(48, 68)]
 print(unknown_class_names)
 train_prev_classnames = known_classes.split(",")
-
-print("known_classes: ",known_classes)
+print("known_classes: ", known_classes)
 class_to_attri_idx = {name: idx for idx, name in enumerate(train_prev_classnames)}
 
 batchsize = config["batch_size"] #9
@@ -400,7 +313,9 @@ def train_epoch(model,params, dynamic_unknown_generator, domainnames, train_load
     tqdm_object = tqdm(train_loader, total=len(train_loader))
     dynamic_unknown_generator.reset_epoch_stats()
 
-    for img_prev, domain_prev, label_prev, label_one_hot_prev in tqdm_object:
+    for batch_idx, (img_prev, domain_prev, label_prev, label_one_hot_prev) in enumerate(tqdm_object):
+        if args.max_train_batches and batch_idx >= args.max_train_batches:
+            break
         img_prev = img_prev.to(device)
         domain_prev = domain_prev.to(device)
 
@@ -527,7 +442,7 @@ warmup_epochs = 1
 lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
             optimizer, mode="min", patience=1, factor=0.8
         )
-num_epochs = 10
+num_epochs = args.epochs
 warmup_period = 1
 num_steps = len(train_dl) * num_epochs - warmup_period
 
@@ -591,7 +506,9 @@ for epoch in range(num_epochs):
         total_correct_b = 0
         total_samples_b = 0
         
-        for test_img, test_domain, test_label, test_label_one_hot in test_tqdm_object:
+        for batch_idx, (test_img, test_domain, test_label, test_label_one_hot) in enumerate(test_tqdm_object):
+            if args.max_test_batches and batch_idx >= args.max_test_batches:
+                break
             test_img = test_img.to(device)
             test_domain =test_domain.to(device)
             test_label = test_label.to(device)
@@ -624,7 +541,11 @@ for epoch in range(num_epochs):
         open_set_accuracy = total_correct_b / total_samples_b if total_samples_b > 0 else 0.0
         open_set_acc = open_set_accuracy*100
 
-        average_acc = (2*closed_set_acc*open_set_acc)/(closed_set_acc + open_set_acc)
+        average_acc = (
+            (2 * closed_set_acc * open_set_acc) / (closed_set_acc + open_set_acc)
+            if (closed_set_acc + open_set_acc) > 0
+            else 0.0
+        )
 
         print(f"Closed Set Accuracy: {closed_set_acc:.2f}%")
         print(f"Open Set Accuracy: {open_set_acc:.2f}%")
